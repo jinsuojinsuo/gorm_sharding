@@ -1,0 +1,407 @@
+package gorm_sharding
+
+import (
+	"fmt"
+	"reflect"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/callbacks"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	pluginName = "gorm_sharding"
+	skipKey    = "gorm_sharding:skip"
+)
+
+// Plugin 是 GORM 分表插件主体，保存模型配置并接管 GORM 核心回调。
+type Plugin struct {
+	configs map[reflect.Type]ShardingConfig
+	manager *tableManager
+
+	// 保存 GORM 原始核心回调，分表插件完成路由后仍交回 GORM 执行，
+	// 避免重写 GORM 的 SQL 构建、Hook、Scan、RowsAffected 等细节。
+	createFn func(*gorm.DB)
+	queryFn  func(*gorm.DB)
+	updateFn func(*gorm.DB)
+	deleteFn func(*gorm.DB)
+	rowFn    func(*gorm.DB)
+	rawFn    func(*gorm.DB)
+}
+
+// New 创建一个新的分表插件实例。
+func New() *Plugin {
+	return &Plugin{configs: make(map[reflect.Type]ShardingConfig)}
+}
+
+// Name 返回 GORM 插件名称。
+func (p *Plugin) Name() string {
+	return pluginName
+}
+
+// Register 注册模型和对应分表配置。
+func (p *Plugin) Register(model interface{}, cfg ShardingConfig) error {
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	t := modelKey(model)
+	if t == nil || t.Kind() != reflect.Struct {
+		return fmt.Errorf("gorm_sharding: model must be struct or struct pointer")
+	}
+	p.configs[t] = cfg
+	return nil
+}
+
+// Initialize 接入 GORM，替换 Create/Query/Update/Delete/Raw 的核心执行回调。
+func (p *Plugin) Initialize(db *gorm.DB) error {
+	p.manager = newTableManager(db)
+
+	// Replace 之前先取出原始回调；后续插件回调内部会在改完表名后调用它们。
+	p.createFn = db.Callback().Create().Get("gorm:create")
+	p.queryFn = db.Callback().Query().Get("gorm:query")
+	p.updateFn = db.Callback().Update().Get("gorm:update")
+	p.deleteFn = db.Callback().Delete().Get("gorm:delete")
+	p.rowFn = db.Callback().Row().Get("gorm:row")
+	p.rawFn = db.Callback().Raw().Get("gorm:raw")
+	if err := db.Callback().Create().Replace("gorm:create", p.create); err != nil {
+		return err
+	}
+	if err := db.Callback().Query().Replace("gorm:query", p.query); err != nil {
+		return err
+	}
+	if err := db.Callback().Update().Replace("gorm:update", p.update); err != nil {
+		return err
+	}
+	if err := db.Callback().Delete().Replace("gorm:delete", p.delete); err != nil {
+		return err
+	}
+	if err := db.Callback().Row().Replace("gorm:row", p.row); err != nil {
+		return err
+	}
+	if err := db.Callback().Raw().Replace("gorm:raw", p.raw); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AutoMigrate 迁移已注册模型的历史分表，不创建逻辑模板表。
+func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
+	for _, model := range models {
+		cfg, ok := p.configs[modelKey(model)]
+		if !ok || !cfg.AutoMigrate {
+			continue
+		}
+		// 需求要求无模板表，所以这里不迁移逻辑表，只迁移已经存在的历史分表。
+		if err := p.manager.autoMigrate(model, cfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// configFor 根据当前 GORM Statement 找到模型对应的分表配置。
+func (p *Plugin) configFor(db *gorm.DB) (ShardingConfig, bool) {
+	if skipped, ok := db.Get(skipKey); ok && skipped == true {
+		return ShardingConfig{}, false
+	}
+	if db.Statement == nil {
+		return ShardingConfig{}, false
+	}
+	if db.Statement.Schema != nil {
+		cfg, ok := p.configs[db.Statement.Schema.ModelType]
+		return cfg, ok
+	}
+	if db.Statement.Model != nil {
+		cfg, ok := p.configs[modelKey(db.Statement.Model)]
+		return cfg, ok
+	}
+	if db.Statement.Dest != nil {
+		cfg, ok := p.configs[modelKey(db.Statement.Dest)]
+		return cfg, ok
+	}
+	return ShardingConfig{}, false
+}
+
+// create 处理插入路由、自动建表和批量插入分组。
+func (p *Plugin) create(db *gorm.DB) {
+	cfg, ok := p.configFor(db)
+	if !ok {
+		p.createFn(db)
+		return
+	}
+
+	groups, err := p.groupCreateValues(db, cfg)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
+	if len(groups) == 1 {
+		for table := range groups {
+			if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+				db.AddError(err)
+				return
+			}
+			// 单分表插入只替换当前 Statement 的表名，后续交给 GORM 原始 create 回调。
+			setStatementTable(db, table)
+			p.createFn(db)
+			return
+		}
+	}
+
+	var rows int64
+	for table, values := range groups {
+		if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+			db.AddError(err)
+			return
+		}
+		// 批量数据可能分散到多张表，必须拆成多次 Create，并累加 RowsAffected。
+		// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
+		tx := db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Set(skipKey, true).Table(table)
+		if err := tx.Create(values.Interface()).Error; err != nil {
+			db.AddError(err)
+			return
+		}
+		rows += tx.RowsAffected
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// query 处理查询路由，单表交给 GORM，跨表逐表查询并合并结果。
+func (p *Plugin) query(db *gorm.DB) {
+	if db.Statement.SQL.Len() > 0 {
+		// db.Raw(...).Scan(...) 已经提前写好了 SQL，它走 Query 回调而不是 RawExec 回调。
+		// 这里先尝试 AST 改写逻辑表名，再交给 GORM 原始 query 回调执行和扫描结果。
+		sql, ok, err := p.rewriteRawSQL(db)
+		if err != nil {
+			db.AddError(err)
+			return
+		}
+		if ok {
+			db.Statement.SQL.Reset()
+			db.Statement.SQL.WriteString(sql)
+		}
+		p.queryFn(db)
+		return
+	}
+
+	cfg, ok := p.configFor(db)
+	if !ok {
+		p.queryFn(db)
+		return
+	}
+	tables := p.routeTables(db, cfg)
+	if len(tables) <= 1 {
+		if len(tables) == 1 {
+			// 精确命中一张表时保持普通 GORM 查询路径，返回值和单表体验一致。
+			setStatementTable(db, tables[0])
+		}
+		p.queryFn(db)
+		if len(tables) == 1 && p.handleMissingTable(db, cfg, tables[0]) {
+			return
+		}
+		return
+	}
+	if len(db.Statement.Joins) > 0 {
+		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
+		return
+	}
+	if _, ok := db.Statement.Clauses["GROUP BY"]; ok {
+		db.AddError(fmt.Errorf("gorm_sharding: group query is not supported"))
+		return
+	}
+	if _, ok := db.Statement.Clauses["ORDER BY"]; ok {
+		if _, hasLimit := db.Statement.Clauses["LIMIT"]; hasLimit {
+			db.AddError(fmt.Errorf("gorm_sharding: order with limit across shards is not supported"))
+			return
+		}
+	}
+	scanInto := db.Statement.Dest
+	dst := reflect.ValueOf(scanInto)
+	if dst.Kind() != reflect.Ptr || dst.Elem().Kind() != reflect.Slice {
+		db.AddError(fmt.Errorf("gorm_sharding: cross table query destination must be slice pointer"))
+		return
+	}
+	total := reflect.MakeSlice(dst.Elem().Type(), 0, 0)
+	var rows int64
+	for _, table := range tables {
+		// 跨分表查询逐表执行，再把每张表扫描到的切片追加回原始目标切片。
+		item := reflect.New(dst.Elem().Type()).Interface()
+		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
+		copyQueryState(tx, db)
+		tx = tx.Set(skipKey, true)
+		if err := tx.Find(item).Error; err != nil {
+			if isMissingTableError(err) {
+				p.manager.invalidate(cfg, table)
+				continue
+			}
+			db.AddError(err)
+			return
+		}
+		rows += tx.RowsAffected
+		total = reflect.AppendSlice(total, reflect.ValueOf(item).Elem())
+	}
+	dst.Elem().Set(total)
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// update 处理更新请求，按分表条件决定单表更新或多表扫描更新。
+func (p *Plugin) update(db *gorm.DB) {
+	p.execUpdateAcrossTables(db)
+}
+
+// delete 处理删除请求，按分表条件决定单表删除或多表扫描删除。
+func (p *Plugin) delete(db *gorm.DB) {
+	p.execDeleteAcrossTables(db)
+}
+
+// execUpdateAcrossTables 执行 Update 的单表路由或多表扫描逻辑。
+func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
+	cfg, ok := p.configFor(db)
+	if !ok {
+		p.updateFn(db)
+		return
+	}
+	tables := p.routeTables(db, cfg)
+	if len(tables) <= 1 {
+		if len(tables) == 1 {
+			setStatementTable(db, tables[0])
+		}
+		p.updateFn(db)
+		if len(tables) == 1 && p.handleMissingTable(db, cfg, tables[0]) {
+			return
+		}
+		return
+	}
+	var rows int64
+	for _, table := range tables {
+		// Update/Delete 没有分表条件时扫描最近 N 张表，每张表独立执行并累加影响行数。
+		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
+		copyWriteState(tx, db)
+		tx = tx.Set(skipKey, true)
+		tx = tx.Model(db.Statement.Model).Updates(db.Statement.Dest)
+		if tx.Error != nil {
+			if isMissingTableError(tx.Error) {
+				p.manager.invalidate(cfg, table)
+				continue
+			}
+			db.AddError(tx.Error)
+			return
+		}
+		rows += tx.RowsAffected
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// execDeleteAcrossTables 执行 Delete 的单表路由或多表扫描逻辑。
+func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
+	cfg, ok := p.configFor(db)
+	if !ok {
+		p.deleteFn(db)
+		return
+	}
+	tables := p.routeTables(db, cfg)
+	if len(tables) <= 1 {
+		if len(tables) == 1 {
+			setStatementTable(db, tables[0])
+		}
+		p.deleteFn(db)
+		if len(tables) == 1 && p.handleMissingTable(db, cfg, tables[0]) {
+			return
+		}
+		return
+	}
+	var rows int64
+	for _, table := range tables {
+		// Delete 多表扫描也必须走 GORM 公共 API，让 GORM 自己完成 Statement 初始化。
+		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
+		copyWriteState(tx, db)
+		tx = tx.Set(skipKey, true)
+		tx = tx.Delete(db.Statement.Dest)
+		if tx.Error != nil {
+			if isMissingTableError(tx.Error) {
+				p.manager.invalidate(cfg, table)
+				continue
+			}
+			db.AddError(tx.Error)
+			return
+		}
+		rows += tx.RowsAffected
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// raw 处理 GORM Raw/Exec SQL 的表名 AST 改写并执行原始 Raw 回调。
+func (p *Plugin) raw(db *gorm.DB) {
+	sql, ok, err := p.rewriteRawSQL(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
+	if ok {
+		db.Statement.SQL.Reset()
+		db.Statement.SQL.WriteString(sql)
+	}
+	callbacks.RawExec(db)
+}
+
+// row 处理 db.Raw(...).Scan/Rows/Row 这类走 Row 回调的 SQL 改写。
+func (p *Plugin) row(db *gorm.DB) {
+	if db.Statement.SQL.Len() > 0 {
+		sql, ok, err := p.rewriteRawSQL(db)
+		if err != nil {
+			db.AddError(err)
+			return
+		}
+		if ok {
+			db.Statement.SQL.Reset()
+			db.Statement.SQL.WriteString(sql)
+		}
+	}
+	p.rowFn(db)
+}
+
+// setStatementTable 把当前 GORM Statement 的逻辑表切换成真实分表。
+func setStatementTable(db *gorm.DB, table string) {
+	// GORM 构建 SQL 时会同时参考 Table 和 TableExpr，两者都需要切到真实分表。
+	db.Statement.Table = table
+	db.Statement.TableExpr = &clause.Expr{SQL: db.Statement.Quote(table)}
+}
+
+// routeTables 根据分表字段条件计算本次操作要访问的真实分表列表。
+func (p *Plugin) routeTables(db *gorm.DB, cfg ShardingConfig) []string {
+	// 路由优先级：精确时间条件 > 时间范围条件 > 最近 MaxScanTables 张表。
+	if t, ok := timeFromStatement(db, cfg.ShardingKey); ok {
+		return []string{cfg.tableName(t)}
+	}
+	if start, end, ok := timeRangeFromStatement(db, cfg.ShardingKey); ok {
+		return tablesForRange(cfg, start, end)
+	}
+	return p.manager.tables(cfg, time.Now())
+}
+
+// handleMissingTable 清理被外部删除的表缓存，并把本次操作按目标表不存在处理。
+func (p *Plugin) handleMissingTable(db *gorm.DB, cfg ShardingConfig, table string) bool {
+	if !isMissingTableError(db.Error) {
+		return false
+	}
+	p.manager.invalidate(cfg, table)
+	db.Error = nil
+	db.RowsAffected = 0
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = 0
+	}
+	return true
+}

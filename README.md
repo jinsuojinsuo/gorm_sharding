@@ -42,6 +42,10 @@ type User struct {
 	UpdatedAt time.Time `gorm:"column:updated_at;type:datetime;not null"`
 }
 
+func (User) TableName() string {
+	return "user"
+}
+
 func main() {
 	db, err := gorm.Open(mysql.Open("user:pass@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local"))
 	if err != nil {
@@ -52,7 +56,6 @@ func main() {
 	if err := plugin.Register(User{}, gorm_sharding.ShardingConfig{
 		ShardingKey:     "created_at",
 		Strategy:        gorm_sharding.HourStrategy,
-		TablePrefix:     "user",
 		MaxScanTables:   3,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -60,6 +63,7 @@ func main() {
 		panic(err)
 	}
 
+	//必须要先 plugin.Register再db.Use
 	if err := db.Use(plugin); err != nil {
 		panic(err)
 	}
@@ -86,9 +90,6 @@ type ShardingConfig struct {
 	// 分表策略，决定表名后缀和最近表倒推粒度。
 	Strategy ShardingStrategy
 
-	// 真实分表前缀，例如 user 会生成 user_2026080417。
-	TablePrefix string
-
 	// 无分表条件时最多扫描的最近分表数量。
 	MaxScanTables int
 
@@ -99,6 +100,8 @@ type ShardingConfig struct {
 	AutoMigrate bool
 }
 ```
+
+真实分表前缀来自 GORM 逻辑表名。模型实现 `TableName()` 时使用该返回值；未实现时使用 GORM 默认命名规则。
 
 ## 分表策略
 
@@ -111,6 +114,42 @@ type ShardingConfig struct {
 | `HourStrategy` | `2026080417` | `user_2026080417` |
 
 ## CRUD 示例
+
+### 插入
+
+插件支持 GORM 常见 `Create` 插入方式。插入时会读取模型里的分表字段，计算目标真实表名；目标表不存在且 `AutoCreateTable` 为 `true` 时，会先自动建表。
+
+```go
+now := time.Now()
+
+// 单条插入
+err := db.Create(&User{
+	Name:      "alice",
+	Score:     100,
+	CreatedAt: now,
+	UpdatedAt: now,
+}).Error
+
+// 批量插入；不同分表的数据会自动按真实表拆分后逐表插入。
+users := []User{
+	{Name: "alice", CreatedAt: now, UpdatedAt: now},
+	{Name: "bob", CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
+}
+err = db.Create(&users).Error
+
+// 显式批量插入；插件会保留 GORM 的批大小设置。
+err = db.CreateInBatches(&users, 1000).Error
+
+// 也支持通过 GORM Session 配置批大小。
+err = db.Session(&gorm.Session{CreateBatchSize: 1000}).Create(&users).Error
+```
+
+批量插入规则：
+
+1. 同一真实分表内的数据会继续使用 GORM 批量插入。
+2. 跨真实分表的数据会先按目标表拆分，再分别执行插入。
+3. `RowsAffected` 会累加所有真实分表的影响行数。
+4. 分表字段必须能从每条记录中取到 `time.Time` 值，否则会返回错误。
 
 ### 精确查询
 
@@ -134,6 +173,39 @@ err := db.Where("name = ?", "alice").Find(&users).Error
 ```
 
 该场景不会扫描全部历史表，只会扫描最近 `MaxScanTables` 张真实分表。
+
+### 支持的分表条件写法
+
+插件会优先从 GORM `WHERE` 条件中解析分表字段，能识别以下常见写法：
+
+```go
+// 等值条件
+db.Where("created_at = ?", createdAt)
+db.Where("created_at = ? AND name = ?", createdAt, "alice")
+
+// 带表名前缀或反引号
+db.Where("users.created_at = ?", createdAt)
+db.Where("`users`.`created_at` = ?", createdAt)
+
+// BETWEEN 范围
+db.Where("created_at BETWEEN ? AND ?", start, end)
+
+// 半开区间
+db.Where("created_at >= ? AND created_at < ?", start, end)
+db.Where("created_at > ? AND created_at <= ?", start, end)
+
+// IN 条件
+db.Where("created_at IN (?, ?)", t1, t2)
+db.Where("created_at IN ?", []time.Time{t1, t2})
+
+// GORM clause 条件
+db.Where(clause.Eq{Column: "created_at", Value: createdAt})
+db.Where(clause.Gte{Column: "created_at", Value: start}).
+	Where(clause.Lt{Column: "created_at", Value: end})
+db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
+```
+
+如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 张真实分表。
 
 ### 更新
 

@@ -94,7 +94,7 @@ func (p *Plugin) rewriteTableName(table *sqlparser.TableName) (bool, error) {
 func (p *Plugin) configByPrefix(name string) (ShardingConfig, bool) {
 	name = strings.Trim(name, "`")
 	for _, cfg := range p.configs {
-		if cfg.TablePrefix == name {
+		if cfg.tablePrefix == name {
 			return cfg, true
 		}
 	}

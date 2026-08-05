@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,12 +23,22 @@ type requirementUser struct {
 	UpdatedAt time.Time `gorm:"column:updated_at;type:datetime;not null"`
 }
 
+// TableName 返回测试用户表逻辑表名，插件会用它作为分表前缀。
+func (requirementUser) TableName() string {
+	return "gs_req_user"
+}
+
 // requirementUserV1 模拟历史表创建时的旧结构。
 type requirementUserV1 struct {
 	ID        uint64    `gorm:"column:id;primaryKey;autoIncrement"`
 	Name      string    `gorm:"column:name;type:varchar(64);not null;default:'';index"`
 	CreatedAt time.Time `gorm:"column:created_at;type:datetime;not null;index"`
 	UpdatedAt time.Time `gorm:"column:updated_at;type:datetime;not null"`
+}
+
+// TableName 返回迁移测试旧模型逻辑表名。
+func (requirementUserV1) TableName() string {
+	return "gs_req_migrate_user"
 }
 
 // requirementUserV2 模拟业务模型新增 Age 字段后的最新结构。
@@ -37,6 +48,11 @@ type requirementUserV2 struct {
 	Age       int       `gorm:"column:age;not null;default:0"`
 	CreatedAt time.Time `gorm:"column:created_at;type:datetime;not null;index"`
 	UpdatedAt time.Time `gorm:"column:updated_at;type:datetime;not null"`
+}
+
+// TableName 返回迁移测试新模型逻辑表名，必须和旧模型一致才能迁移同一批历史分表。
+func (requirementUserV2) TableName() string {
+	return "gs_req_migrate_user"
 }
 
 // TestRequirementStrategies 验证需求文档列出的年月周日小时分表后缀。
@@ -64,7 +80,7 @@ func TestRequirementStrategies(t *testing.T) {
 
 // TestRequirementCRUDAndRaw 验证建表、插入、批量拆分、查询、更新、删除、Raw 和 RowsAffected 行为。
 func TestRequirementCRUDAndRaw(t *testing.T) {
-	prefix := "gs_req_crud_user"
+	prefix := requirementUser{}.TableName()
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
 	defer cleanup()
 
@@ -81,7 +97,7 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 		t.Fatalf("batch create split across shards failed: %v", err)
 	}
 
-	cfg := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
 	if tableExists(t, rawDB, prefix) {
 		t.Fatalf("logical template table %s was created", prefix)
 	}
@@ -168,9 +184,47 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 	}
 }
 
+// TestRequirementCreateInBatchesAcrossShards 验证 GORM CreateInBatches 跨分表插入时仍能正确拆表、建表和统计影响行数。
+func TestRequirementCreateInBatchesAcrossShards(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 3, requirementUser{})
+	defer cleanup()
+
+	base := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	users := []requirementUser{
+		{Name: "batch_1", CreatedAt: base.AddDate(0, 0, -2), UpdatedAt: base},
+		{Name: "batch_2", CreatedAt: base.AddDate(0, 0, -1), UpdatedAt: base},
+		{Name: "batch_3", CreatedAt: base, UpdatedAt: base},
+		{Name: "batch_4", CreatedAt: base.AddDate(0, 0, -1), UpdatedAt: base},
+		{Name: "batch_5", CreatedAt: base, UpdatedAt: base},
+	}
+	res := db.CreateInBatches(&users, 2)
+	if res.Error != nil {
+		t.Fatalf("CreateInBatches across shards failed: %v", res.Error)
+	}
+	if res.RowsAffected != int64(len(users)) {
+		t.Fatalf("CreateInBatches RowsAffected = %d, want %d", res.RowsAffected, len(users))
+	}
+
+	cfg := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}
+	for _, tt := range []struct {
+		at   time.Time
+		want int64
+	}{
+		{at: base.AddDate(0, 0, -2), want: 1},
+		{at: base.AddDate(0, 0, -1), want: 2},
+		{at: base, want: 2},
+	} {
+		table := cfg.tableName(tt.at)
+		if got := countRows(t, rawDB, table, "name LIKE 'batch_%'"); got != tt.want {
+			t.Fatalf("rows in %s = %d, want %d", table, got, tt.want)
+		}
+	}
+}
+
 // TestRequirementPreciseWriteWithAdditionalPredicates 验证包含分表字段和其他条件时仍然精确路由目标表。
 func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
-	prefix := "gs_req_precise_where_user"
+	prefix := requirementUser{}.TableName()
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
 	defer cleanup()
 
@@ -196,7 +250,7 @@ func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
 		t.Fatalf("compound precise update RowsAffected = %d, want 1", res.RowsAffected)
 	}
 
-	table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}.tableName(oldAt)
+	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}.tableName(oldAt)
 	if got := countRows(t, rawDB, table, "name = 'target' AND score = 33"); got != 1 {
 		t.Fatalf("compound precise update did not hit old shard, rows = %d", got)
 	}
@@ -212,7 +266,7 @@ func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
 
 // TestRequirementUnsupportedCrossShardQueries 验证第一版明确不支持的跨分表 Join、Group By、Order+Limit。
 func TestRequirementUnsupportedCrossShardQueries(t *testing.T) {
-	prefix := "gs_req_unsupported_user"
+	prefix := requirementUser{}.TableName()
 	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
 	defer cleanup()
 
@@ -259,7 +313,7 @@ func TestRequirementUnsupportedCrossShardQueries(t *testing.T) {
 
 // TestRequirementMissingTableInvalidatesAfterSQL 验证先执行 SQL，遇到 1146 后再清缓存并按表不存在处理。
 func TestRequirementMissingTableInvalidatesAfterSQL(t *testing.T) {
-	prefix := "gs_req_missing_user"
+	prefix := requirementUser{}.TableName()
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 3, requirementUser{})
 	defer cleanup()
 
@@ -272,7 +326,7 @@ func TestRequirementMissingTableInvalidatesAfterSQL(t *testing.T) {
 		t.Fatalf("warm table-list cache failed: %v", err)
 	}
 
-	table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}.tableName(now)
+	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}.tableName(now)
 	if err := rawDB.Exec("DROP TABLE " + quoteIdent(table)).Error; err != nil {
 		t.Fatalf("drop test shard table failed: %v", err)
 	}
@@ -297,7 +351,7 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 	cfg := ShardingConfig{
 		ShardingKey:     "created_at",
 		Strategy:        HourStrategy,
-		TablePrefix:     prefix,
+		tablePrefix:     prefix,
 		MaxScanTables:   2,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -335,9 +389,70 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 	}
 }
 
+// TestRequirementConcurrentCreateSameShard 验证切表瞬间并发首次写同一新分表时只暴露正常插入结果。
+func TestRequirementConcurrentCreateSameShard(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, HourStrategy, 3, requirementUser{})
+	defer cleanup()
+
+	createdAt := time.Date(2026, 8, 5, 10, 0, 0, 0, time.Local)
+	const workers = 20
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- db.Create(&requirementUser{
+				Name:      fmt.Sprintf("worker_%02d", i),
+				CreatedAt: createdAt,
+				UpdatedAt: createdAt,
+			}).Error
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent create returned error: %v", err)
+		}
+	}
+	table := ShardingConfig{tablePrefix: prefix, Strategy: HourStrategy, MaxScanTables: 3}.tableName(createdAt)
+	if got := countRows(t, rawDB, table, "1=1"); got != workers {
+		t.Fatalf("concurrent create rows = %d, want %d", got, workers)
+	}
+}
+
+// TestRequirementRejectsDuplicateInitialize 验证同一个插件实例不能重复绑定多个 DB。
+func TestRequirementRejectsDuplicateInitialize(t *testing.T) {
+	plugin := New()
+	if err := plugin.Register(requirementUser{}, ShardingConfig{
+		ShardingKey:     "created_at",
+		Strategy:        HourStrategy,
+		MaxScanTables:   3,
+		AutoCreateTable: true,
+		AutoMigrate:     true,
+	}); err != nil {
+		t.Fatalf("register plugin failed: %v", err)
+	}
+
+	db1 := openRequirementDB(t)
+	defer closeRequirementDB(t, db1)
+	db2 := openRequirementDB(t)
+	defer closeRequirementDB(t, db2)
+
+	if err := db1.Use(plugin); err != nil {
+		t.Fatalf("first plugin use failed: %v", err)
+	}
+	if err := db2.Use(plugin); err == nil {
+		t.Fatalf("second plugin use should be rejected")
+	}
+}
+
 // TestRequirementPluginAutoMigrateSyncsHistoricalTables 验证插件 AutoMigrate 能同步历史分表新字段。
 func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
-	prefix := "gs_req_plugin_migrate_user"
+	prefix := requirementUserV1{}.TableName()
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, MonthStrategy, 5, requirementUserV1{})
 	defer cleanup()
 
@@ -350,7 +465,6 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 	if err := plugin.Register(requirementUserV2{}, ShardingConfig{
 		ShardingKey:     "created_at",
 		Strategy:        MonthStrategy,
-		TablePrefix:     prefix,
 		MaxScanTables:   5,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -366,7 +480,7 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 		t.Fatalf("plugin AutoMigrate failed: %v", err)
 	}
 
-	table := ShardingConfig{TablePrefix: prefix, Strategy: MonthStrategy, MaxScanTables: 5}.tableName(createdAt)
+	table := ShardingConfig{tablePrefix: prefix, Strategy: MonthStrategy, MaxScanTables: 5}.tableName(createdAt)
 	if !columnExists(t, rawDB, table, "age") {
 		t.Fatalf("historical shard %s does not have migrated age column", table)
 	}
@@ -383,7 +497,6 @@ func newRequirementShardedDB(t *testing.T, prefix string, strategy ShardingStrat
 	if err := plugin.Register(model, ShardingConfig{
 		ShardingKey:     "created_at",
 		Strategy:        strategy,
-		TablePrefix:     prefix,
 		MaxScanTables:   maxScanTables,
 		AutoCreateTable: true,
 		AutoMigrate:     true,

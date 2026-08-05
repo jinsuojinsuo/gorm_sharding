@@ -23,9 +23,6 @@ type ShardingConfig struct {
 	// Strategy 是分表策略，决定表名后缀和倒推扫描粒度。
 	Strategy ShardingStrategy
 
-	// TablePrefix 是真实分表的表名前缀，例如 user 会生成 user_202608。
-	TablePrefix string
-
 	// MaxScanTables 是无分表条件时最多扫描的最近分表数量。
 	MaxScanTables int
 
@@ -34,6 +31,9 @@ type ShardingConfig struct {
 
 	// AutoMigrate 控制调用插件 AutoMigrate 时是否迁移该模型的历史分表。
 	AutoMigrate bool
+
+	// tablePrefix 是从模型逻辑表名解析出来的真实分表前缀，例如 user 会生成 user_202608。
+	tablePrefix string
 }
 
 // validate 校验分表配置是否具备运行所需的必要参数。
@@ -44,9 +44,6 @@ func (c ShardingConfig) validate() error {
 	if c.Strategy == nil {
 		return fmt.Errorf("gorm_sharding: sharding strategy is nil")
 	}
-	if c.TablePrefix == "" {
-		return fmt.Errorf("gorm_sharding: table prefix is empty")
-	}
 	if c.MaxScanTables <= 0 {
 		return fmt.Errorf("gorm_sharding: max scan tables must be greater than zero")
 	}
@@ -55,7 +52,7 @@ func (c ShardingConfig) validate() error {
 
 // tableName 根据配置和时间生成真实分表名。
 func (c ShardingConfig) tableName(t time.Time) string {
-	return c.TablePrefix + "_" + c.Strategy.Suffix(t)
+	return c.tablePrefix + "_" + c.Strategy.Suffix(t)
 }
 
 // modelKey 把 struct、指针、slice 等模型输入统一归一成 struct 类型。
@@ -75,5 +72,9 @@ func modelKey(v interface{}) reflect.Type {
 
 // normalizeColumnName 去掉列名两侧空白和反引号，便于比较 GORM 条件里的字段名。
 func normalizeColumnName(s string) string {
-	return strings.Trim(strings.TrimSpace(s), "`")
+	s = strings.Trim(strings.TrimSpace(s), "`")
+	if index := strings.LastIndex(s, "."); index >= 0 {
+		s = s[index+1:]
+	}
+	return strings.Trim(s, "`")
 }

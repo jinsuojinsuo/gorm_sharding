@@ -9,6 +9,7 @@ import (
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
 
@@ -21,6 +22,9 @@ type tableManager struct {
 
 	// tableLists 缓存“最近 N 张表”的查询结果；缓存键包含当前分片，跨分片时间后会自动失效。
 	tableLists sync.Map
+
+	// createGroup 合并同一真实分表的并发建表请求，避免切表瞬间重复 AutoMigrate。
+	createGroup singleflight.Group
 }
 
 // newTableManager 创建表管理器实例。
@@ -60,13 +64,19 @@ func (m *tableManager) ensure(model interface{}, cfg ShardingConfig, table strin
 	if m.exists(table) {
 		return nil
 	}
-	// 不手写 CREATE TABLE，直接让 GORM AutoMigrate 根据 struct 和 tag 创建真实分表。
-	if err := m.db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
-		return err
-	}
-	m.seen.Store(table, struct{}{})
-	m.clearTableListCache(cfg)
-	return nil
+	_, err, _ := m.createGroup.Do(table, func() (interface{}, error) {
+		if m.exists(table) {
+			return nil, nil
+		}
+		// 不手写 CREATE TABLE，直接让 GORM AutoMigrate 根据 struct 和 tag 创建真实分表。
+		if err := m.db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
+			return nil, err
+		}
+		m.seen.Store(table, struct{}{})
+		m.clearTableListCache(cfg)
+		return nil, nil
+	})
+	return err
 }
 
 // tables 返回无精确分表条件时需要扫描的最近分表列表。
@@ -98,12 +108,12 @@ func (m *tableManager) tables(cfg ShardingConfig, now time.Time) []string {
 
 // tableListCacheKey 生成最近表列表缓存键；当前分片变化时键也变化，避免跨小时/天/月继续使用旧列表。
 func (m *tableManager) tableListCacheKey(cfg ShardingConfig, now time.Time) string {
-	return fmt.Sprintf("%s|%d|%s", cfg.TablePrefix, cfg.MaxScanTables, cfg.tableName(now))
+	return fmt.Sprintf("%s|%d|%s", cfg.tablePrefix, cfg.MaxScanTables, cfg.tableName(now))
 }
 
 // clearTableListCache 清理指定逻辑表前缀的最近表列表缓存；自动建新分表后需要刷新扫描列表。
 func (m *tableManager) clearTableListCache(cfg ShardingConfig) {
-	prefix := cfg.TablePrefix + "|"
+	prefix := cfg.tablePrefix + "|"
 	m.tableLists.Range(func(key, value interface{}) bool {
 		if strings.HasPrefix(key.(string), prefix) {
 			m.tableLists.Delete(key)
@@ -122,7 +132,7 @@ func (m *tableManager) existingTables(cfg ShardingConfig) ([]string, error) {
 	// 按表名倒序取最近分表；当前策略的表名后缀都按时间递增，倒序就是从新到旧。
 	err := m.db.Raw(
 		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ORDER BY TABLE_NAME DESC LIMIT ?",
-		cfg.TablePrefix+"_%", cfg.MaxScanTables,
+		cfg.tablePrefix+"_%", cfg.MaxScanTables,
 	).Scan(&tables).Error
 	if err != nil {
 		return tables, err

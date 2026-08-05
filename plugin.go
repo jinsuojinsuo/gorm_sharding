@@ -3,11 +3,13 @@ package gorm_sharding
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/callbacks"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 )
 
 const (
@@ -17,6 +19,9 @@ const (
 
 // Plugin 是 GORM 分表插件主体，保存模型配置并接管 GORM 核心回调。
 type Plugin struct {
+	initMu      sync.Mutex
+	initialized bool
+
 	configs map[reflect.Type]ShardingConfig
 	manager *tableManager
 
@@ -55,6 +60,15 @@ func (p *Plugin) Register(model interface{}, cfg ShardingConfig) error {
 
 // Initialize 接入 GORM，替换 Create/Query/Update/Delete/Raw 的核心执行回调。
 func (p *Plugin) Initialize(db *gorm.DB) error {
+	p.initMu.Lock()
+	defer p.initMu.Unlock()
+	if p.initialized {
+		return fmt.Errorf("gorm_sharding: plugin has already been initialized")
+	}
+	if err := p.resolveTablePrefixes(db); err != nil {
+		return err
+	}
+
 	p.manager = newTableManager(db)
 
 	// Replace 之前先取出原始回调；后续插件回调内部会在改完表名后调用它们。
@@ -81,6 +95,22 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 	}
 	if err := db.Callback().Raw().Replace("gorm:raw", p.raw); err != nil {
 		return err
+	}
+	p.initialized = true
+	return nil
+}
+
+// resolveTablePrefixes 使用 GORM schema 解析注册模型的逻辑表名，作为真实分表前缀。
+func (p *Plugin) resolveTablePrefixes(db *gorm.DB) error {
+	cache := &sync.Map{}
+	for modelType, cfg := range p.configs {
+		model := reflect.New(modelType).Interface()
+		parsed, err := schema.Parse(model, cache, db.Config.NamingStrategy)
+		if err != nil {
+			return err
+		}
+		cfg.tablePrefix = parsed.Table
+		p.configs[modelType] = cfg
 	}
 	return nil
 }
@@ -158,16 +188,27 @@ func (p *Plugin) create(db *gorm.DB) {
 		// 批量数据可能分散到多张表，必须拆成多次 Create，并累加 RowsAffected。
 		// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
 		tx := db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Set(skipKey, true).Table(table)
-		if err := tx.Create(values.Interface()).Error; err != nil {
+		res := createShardValues(tx, values.Interface())
+		if err := res.Error; err != nil {
 			db.AddError(err)
 			return
 		}
-		rows += tx.RowsAffected
+		rows += res.RowsAffected
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
 		db.Statement.Result.RowsAffected = rows
 	}
+}
+
+// createShardValues 执行单个真实分表的插入。
+// 当当前 GORM 会话配置了 CreateBatchSize 时，继续走 GORM 的批量插入接口，
+// 避免分表拆分后的内部 Create 丢失批量大小；未配置时保持一次同表批量插入。
+func createShardValues(db *gorm.DB, values interface{}) *gorm.DB {
+	if db.CreateBatchSize > 0 {
+		return db.CreateInBatches(values, db.CreateBatchSize)
+	}
+	return db.Create(values)
 }
 
 // query 处理查询路由，单表交给 GORM，跨表逐表查询并合并结果。
@@ -383,11 +424,13 @@ func setStatementTable(db *gorm.DB, table string) {
 // routeTables 根据分表字段条件计算本次操作要访问的真实分表列表。
 func (p *Plugin) routeTables(db *gorm.DB, cfg ShardingConfig) []string {
 	// 路由优先级：精确时间条件 > 时间范围条件 > 最近 MaxScanTables 张表。
-	if t, ok := timeFromStatement(db, cfg.ShardingKey); ok {
+	if t, ok := timeFromReflect(db.Statement.ReflectValue, db.Statement.Schema, cfg.ShardingKey); ok {
 		return []string{cfg.tableName(t)}
 	}
-	if start, end, ok := timeRangeFromStatement(db, cfg.ShardingKey); ok {
-		return tablesForRange(cfg, start, end)
+	if where, ok := db.Statement.Clauses["WHERE"].Expression.(clause.Where); ok {
+		if tables, ok := tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey); ok {
+			return tables
+		}
 	}
 	return p.manager.tables(cfg, time.Now())
 }

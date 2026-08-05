@@ -145,10 +145,6 @@ type ShardingConfig struct {
     Strategy ShardingStrategy
 
 
-    // 表名前缀
-    TablePrefix string
-
-
     // 最大扫描表数量
     MaxScanTables int
 
@@ -161,6 +157,8 @@ type ShardingConfig struct {
     AutoMigrate bool
 }
 ```
+
+真实分表前缀不再放在配置中，插件会从 GORM 结构体逻辑表名中获取。模型实现 `TableName()` 时使用该返回值；未实现时使用 GORM 默认命名规则。
 
 
 ---
@@ -178,9 +176,6 @@ plugin.Register(
 
         Strategy:
             MonthStrategy,
-
-        TablePrefix:
-            "user",
 
         MaxScanTables:
             10,

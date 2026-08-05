@@ -264,7 +264,7 @@ func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
 	}
 }
 
-// TestRequirementUnsupportedCrossShardQueries 验证第一版明确不支持的跨分表 Join、Group By、Order+Limit。
+// TestRequirementUnsupportedCrossShardQueries 验证跨分表 Join 仍然不支持。
 func TestRequirementUnsupportedCrossShardQueries(t *testing.T) {
 	prefix := requirementUser{}.TableName()
 	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
@@ -272,42 +272,58 @@ func TestRequirementUnsupportedCrossShardQueries(t *testing.T) {
 
 	start := time.Date(2026, 8, 3, 0, 0, 0, 0, time.Local)
 	end := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
-	for _, tt := range []struct {
-		name string
-		run  func(out *[]requirementUser) error
-	}{
-		{
-			name: "join",
-			run: func(out *[]requirementUser) error {
-				return db.Joins("JOIN gs_req_other ON gs_req_other.id = id").
-					Where("created_at BETWEEN ? AND ?", start, end).
-					Find(out).Error
-			},
-		},
-		{
-			name: "group by",
-			run: func(out *[]requirementUser) error {
-				return db.Where("created_at BETWEEN ? AND ?", start, end).
-					Group("name").
-					Find(out).Error
-			},
-		},
-		{
-			name: "order with limit",
-			run: func(out *[]requirementUser) error {
-				return db.Where("created_at BETWEEN ? AND ?", start, end).
-					Order("score desc").
-					Limit(20).
-					Find(out).Error
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var users []requirementUser
-			if err := tt.run(&users); err == nil {
-				t.Fatalf("expected unsupported %s query to return error", tt.name)
-			}
-		})
+	var users []requirementUser
+	if err := db.Joins("JOIN gs_req_other ON gs_req_other.id = id").
+		Where("created_at BETWEEN ? AND ?", start, end).
+		Find(&users).Error; err == nil {
+		t.Fatal("expected unsupported join query to return error")
+	}
+}
+
+// TestRequirementCrossShardOrderLimitAndGroupBy 验证跨分表全局排序分页和聚合由 MySQL 外层 SQL 执行。
+func TestRequirementCrossShardOrderLimitAndGroupBy(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	users := []requirementUser{
+		{Name: "alice", Score: 10, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "alice", Score: 30, CreatedAt: day2, UpdatedAt: day2},
+		{Name: "bob", Score: 20, CreatedAt: day2, UpdatedAt: day2},
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatalf("create cross-shard users: %v", err)
+	}
+
+	var ordered []requirementUser
+	if err := db.Where("created_at BETWEEN ? AND ?", day1, day2).
+		Order("score DESC").
+		Offset(1).
+		Limit(1).
+		Find(&ordered).Error; err != nil {
+		t.Fatalf("cross-shard order and limit: %v", err)
+	}
+	if len(ordered) != 1 || ordered[0].Score != 20 {
+		t.Fatalf("ordered rows = %+v, want score 20 only", ordered)
+	}
+
+	type nameCount struct {
+		Name  string
+		Total int64
+	}
+	var groups []nameCount
+	if err := db.Model(&requirementUser{}).
+		Select("name, COUNT(*) AS total").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Group("name").
+		Order("name ASC").
+		Find(&groups).Error; err != nil {
+		t.Fatalf("cross-shard group by: %v", err)
+	}
+	if len(groups) != 2 || groups[0].Name != "alice" || groups[0].Total != 2 || groups[1].Name != "bob" || groups[1].Total != 1 {
+		t.Fatalf("group rows = %+v, want alice=2 and bob=1", groups)
 	}
 }
 

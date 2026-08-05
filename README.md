@@ -174,6 +174,53 @@ err := db.Where("name = ?", "alice").Find(&users).Error
 
 该场景不会扫描全部历史表，只会扫描最近 `MaxScanTables` 张真实分表。
 
+### 跨分表聚合
+
+跨分表 `Count`、`SUM`、`MIN`、`MAX`、`AVG` 会在 MySQL 内通过 `UNION ALL` 合并原始行后统一计算，返回的是全部命中分表的结果。
+
+```go
+var total int64
+err := db.Model(&User{}).
+	Where("created_at BETWEEN ? AND ?", start, end).
+	Count(&total).Error
+
+// COUNT(DISTINCT ...) 会在全部命中分表的原始行合并后统一去重。
+var distinctNames int64
+err = db.Model(&User{}).
+	Distinct("name").
+	Where("created_at BETWEEN ? AND ?", start, end).
+	Count(&distinctNames).Error
+
+type ScoreStats struct {
+	Total int64
+	Min   int
+	Max   int
+	Avg   float64
+}
+var stats ScoreStats
+err = db.Model(&User{}).
+	Select("SUM(score) AS total, MIN(score) AS min, MAX(score) AS max, AVG(score) AS avg").
+	Where("created_at BETWEEN ? AND ?", start, end).
+	Scan(&stats).Error
+```
+
+分组聚合同样支持：
+
+```go
+type NameCount struct {
+	Name  string
+	Total int64
+}
+var groups []NameCount
+err = db.Model(&User{}).
+	Select("name, COUNT(*) AS total").
+	Where("created_at BETWEEN ? AND ?", start, end).
+	Group("name").
+	Find(&groups).Error
+```
+
+聚合、`Group`、`Order`、`Select`、`Having` 中不要手写逻辑表限定名，例如 `user.score`；请使用 `score`。跨分表 Join 仍不支持。
+
 ### 支持的分表条件写法
 
 插件会优先从 GORM `WHERE` 条件中解析分表字段，能识别以下常见写法：
@@ -233,9 +280,13 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
+Raw/Exec 只支持执行在一张真实分表上的 SQL：`WHERE` 中的分表字段能精确定位一张表时，会路由到该表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`，不会静默只执行其中一张表。未包含可识别分表字段时，保持当前行为并使用最新真实分表。
+
+不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。跨分表写操作请使用 GORM 的 `Updates` 或 `Delete`；跨分表读取请使用 `Find`。
+
 ## 自动迁移
 
-历史分表字段同步使用插件提供的迁移方法：
+最近 `MaxScanTables` 张历史分表的字段同步使用插件提供的迁移方法：
 
 ```go
 if err := plugin.AutoMigrate(db, &User{}); err != nil {
@@ -258,7 +309,7 @@ go run ./_example/gorm_sharding
 示例默认连接：
 
 ```text
-game:123456@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local
+root:123456@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local
 ```
 
 运行前请确认本机 MySQL 账号、密码和数据库可用。
@@ -274,7 +325,7 @@ go test ./... -run TestRequirement -count=1 -v
 测试默认连接：
 
 ```text
-game:123456@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local
+root:123456@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local
 ```
 
 也可以用环境变量覆盖：
@@ -292,10 +343,11 @@ go test ./... -run TestRequirement -count=1 -v
 2. 分表字段只支持 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`。
 3. 不支持 int 时间戳、字符串日期、SQL 表达式计算分表字段。
 4. 跨分表 Join 不支持。
-5. 跨分表 Group By 不支持。
-6. 跨分表 Order + Limit 不支持。
-7. Raw SQL 只支持单表 SQL 的表名改写，不支持复杂 Join 组合。
-8. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
+5. 跨分表 `Order`、`Offset`、`Limit` 已支持：插件会让每张分表先按相同排序取 `offset + limit` 行，再使用 `UNION ALL` 在 MySQL 外层统一排序和分页。仅适用于单模型、无 Join 的查询。
+6. 跨分表 `Group By` 与聚合已支持：插件先 `UNION ALL` 合并各真实分表的原始行，再在外层执行原始 `SELECT`、`GROUP BY`、`HAVING`、`ORDER BY` 与 `LIMIT`，因此常用的 `COUNT`、`SUM`、`MIN`、`MAX`、`AVG` 均由 MySQL 按全量数据计算。
+7. 跨分表 Group By、Order、Limit 不支持 Join 或手写逻辑表限定名，例如 `user.score`；请使用模型字段名或列名，例如 `score`。
+8. Raw SQL 只支持单个真实分表的表名改写；时间条件命中多分表、复杂 Join 均不支持。
+9. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
 
 ## 性能说明
 

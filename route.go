@@ -2,13 +2,18 @@ package gorm_sharding
 
 import (
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+var inArgumentPattern = regexp.MustCompile(`(?i)\bin\s+\?`)
 
 // timeFromStatement 从当前 GORM Statement 中提取精确的分表时间。
 func timeFromStatement(db *gorm.DB, key string) (time.Time, bool) {
@@ -35,8 +40,8 @@ func tablesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) 
 	if values, ok := timeValuesFromExprs(exprs, key); ok {
 		return tablesForTimes(cfg, values), true
 	}
-	if start, end, ok := timeRangeFromExprs(exprs, key); ok {
-		return tablesForRange(cfg, start, end), true
+	if bounds, ok := timeRangeBoundsFromExprs(exprs, key); ok {
+		return tablesForRangeBounds(cfg, bounds), true
 	}
 	return nil, false
 }
@@ -138,137 +143,269 @@ func timeValuesFromExprs(exprs []clause.Expression, key string) ([]time.Time, bo
 	return out, true
 }
 
-// timeValuesFromSQLExpr 从字符串 where 条件里找出分表字段等值或 IN 条件，并按 ? 位置匹配参数。
+// timeValuesFromSQLExpr 使用 Vitess AST 找出分表字段的等值或 IN 条件。
 func timeValuesFromSQLExpr(sql string, vars []interface{}, key string) ([]time.Time, bool) {
-	key = normalizeColumnName(key)
-	lowerSQL := strings.ToLower(sql)
-	candidates := columnCandidates(key)
-	out := make([]time.Time, 0)
-	for _, candidate := range candidates {
-		for offset := 0; offset < len(lowerSQL); {
-			pos := strings.Index(lowerSQL[offset:], candidate)
-			if pos < 0 {
-				break
-			}
-			pos += offset
-			after := strings.TrimSpace(sql[pos+len(candidate):])
-			if strings.HasPrefix(after, "=") {
-				after = strings.TrimSpace(after[1:])
-				if strings.HasPrefix(after, "?") {
-					argIndex := strings.Count(sql[:pos], "?")
-					if argIndex < len(vars) {
-						if t, ok := asTime(vars[argIndex]); ok {
-							out = append(out, t)
-						}
-					}
-				}
-			}
-			if strings.HasPrefix(strings.ToLower(after), "in") {
-				after = strings.TrimSpace(after[len("in"):])
-				argIndex := strings.Count(sql[:pos], "?")
-				if strings.HasPrefix(after, "?") && argIndex < len(vars) {
-					if values, ok := asTimes(vars[argIndex]); ok {
-						out = append(out, values...)
-					}
-				}
-				if strings.HasPrefix(after, "(") {
-					end := strings.Index(after, ")")
-					if end > 0 {
-						count := strings.Count(after[:end], "?")
-						for i := 0; i < count && argIndex+i < len(vars); i++ {
-							if t, ok := asTime(vars[argIndex+i]); ok {
-								out = append(out, t)
-							}
-						}
-					}
-				}
-			}
-			offset = pos + len(candidate)
-		}
-	}
-	if len(out) == 0 {
+	expr, ok := parseConditionSQL(sql)
+	if !ok {
 		return nil, false
 	}
-	return out, true
+	return timeValuesFromVitessExpr(expr, vars, key)
 }
 
 // timeRangeFromExprs 从 GORM where 表达式中提取时间范围条件。
 func timeRangeFromExprs(exprs []clause.Expression, key string) (time.Time, time.Time, bool) {
-	var start, end time.Time
+	bounds, ok := timeRangeBoundsFromExprs(exprs, key)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
+	return bounds.start, bounds.end, true
+}
+
+type timeRangeBounds struct {
+	start        time.Time
+	end          time.Time
+	endExclusive bool
+}
+
+// timeRangeBoundsFromExprs 提取时间范围及上界是否排除，供分表边界计算使用。
+func timeRangeBoundsFromExprs(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
+	var bounds timeRangeBounds
 	for _, expr := range exprs {
 		switch e := expr.(type) {
 		case clause.Expr:
-			// 支持 BETWEEN 和 >=/< 这类常见字符串范围条件。
-			if s, t, ok := timeRangeFromSQLExpr(e.SQL, e.Vars, key); ok {
-				return s, t, true
+			if parsed, ok := timeRangeBoundsFromSQLExpr(e.SQL, e.Vars, key); ok {
+				return parsed, true
 			}
 		case clause.Gt:
 			if columnMatches(e.Column, key) {
-				start, _ = asTime(e.Value)
+				bounds.start, _ = asTime(e.Value)
 			}
 		case clause.Gte:
 			if columnMatches(e.Column, key) {
-				start, _ = asTime(e.Value)
+				bounds.start, _ = asTime(e.Value)
 			}
 		case clause.Lt:
 			if columnMatches(e.Column, key) {
-				end, _ = asTime(e.Value)
+				bounds.end, _ = asTime(e.Value)
+				bounds.endExclusive = true
 			}
 		case clause.Lte:
 			if columnMatches(e.Column, key) {
-				end, _ = asTime(e.Value)
+				bounds.end, _ = asTime(e.Value)
 			}
 		case clause.AndConditions:
-			if s, t, ok := timeRangeFromExprs(e.Exprs, key); ok {
-				return s, t, true
+			if parsed, ok := timeRangeBoundsFromExprs(e.Exprs, key); ok {
+				return parsed, true
 			}
 		}
 	}
-	if !start.IsZero() && !end.IsZero() {
-		return start, end, true
+	if !bounds.start.IsZero() && !bounds.end.IsZero() {
+		return bounds, true
 	}
-	return time.Time{}, time.Time{}, false
+	return timeRangeBounds{}, false
 }
 
 // timeRangeFromSQLExpr 从字符串 where 条件中提取 BETWEEN 或上下界时间条件。
 func timeRangeFromSQLExpr(sql string, vars []interface{}, key string) (time.Time, time.Time, bool) {
-	key = normalizeColumnName(key)
-	lowerSQL := strings.ToLower(sql)
-	var start, end time.Time
-	for _, candidate := range columnCandidates(key) {
-		for offset := 0; offset < len(lowerSQL); {
-			pos := strings.Index(lowerSQL[offset:], candidate)
-			if pos < 0 {
-				break
-			}
-			pos += offset
-			after := strings.TrimSpace(sql[pos+len(candidate):])
-			lowerAfter := strings.ToLower(after)
-			argIndex := strings.Count(sql[:pos], "?")
-			if strings.HasPrefix(lowerAfter, "between") && argIndex+1 < len(vars) {
-				if s, ok := asTime(vars[argIndex]); ok {
-					if t, ok := asTime(vars[argIndex+1]); ok {
-						return s, t, true
-					}
-				}
-			}
-			if strings.HasPrefix(after, ">=") || strings.HasPrefix(after, ">") {
-				if argIndex < len(vars) {
-					start, _ = asTime(vars[argIndex])
-				}
-			}
-			if strings.HasPrefix(after, "<=") || strings.HasPrefix(after, "<") {
-				if argIndex < len(vars) {
-					end, _ = asTime(vars[argIndex])
-				}
-			}
-			offset = pos + len(candidate)
+	bounds, ok := timeRangeBoundsFromSQLExpr(sql, vars, key)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
+	return bounds.start, bounds.end, true
+}
+
+// timeRangeBoundsFromSQLExpr 使用 Vitess AST 从字符串条件中提取时间范围。
+func timeRangeBoundsFromSQLExpr(sql string, vars []interface{}, key string) (timeRangeBounds, bool) {
+	expr, ok := parseConditionSQL(sql)
+	if !ok {
+		return timeRangeBounds{}, false
+	}
+	return timeRangeBoundsFromVitessExpr(expr, vars, key)
+}
+
+// parseConditionSQL 把 GORM 的字符串条件包装为 SELECT，再交给 Vitess 解析。
+func parseConditionSQL(sql string) (sqlparser.Expr, bool) {
+	// GORM 的 IN ? 会把时间切片作为一个参数传入，而 Vitess 要求列表参数带圆括号。
+	// 字段识别仍完全依赖后续 Vitess AST，不使用字符串匹配分表字段。
+	sql = inArgumentPattern.ReplaceAllString(sql, "IN (?)")
+	stmt, err := sqlparser.NewTestParser().Parse("SELECT 1 WHERE " + sql)
+	if err != nil {
+		return nil, false
+	}
+	selectStmt, ok := stmt.(*sqlparser.Select)
+	if !ok || selectStmt.Where == nil {
+		return nil, false
+	}
+	return selectStmt.Where.Expr, true
+}
+
+// rawStatementTables 从 Raw SQL 的 WHERE AST 中计算精确目标分表。
+// routed 为 false 表示条件不含可识别的分表字段，调用方可按默认最近表策略处理。
+func rawStatementTables(stmt sqlparser.Statement, vars []interface{}, cfg ShardingConfig, key string) ([]string, bool) {
+	var where *sqlparser.Where
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		where = s.Where
+	case *sqlparser.Update:
+		where = s.Where
+	case *sqlparser.Delete:
+		where = s.Where
+	default:
+		return nil, false
+	}
+	if where == nil {
+		return nil, false
+	}
+	if values, ok := timeValuesFromVitessExpr(where.Expr, vars, key); ok {
+		return tablesForTimes(cfg, values), true
+	}
+	if bounds, ok := timeRangeBoundsFromVitessExpr(where.Expr, vars, key); ok {
+		if bounds.start.IsZero() || bounds.end.IsZero() {
+			return nil, false
+		}
+		return tablesForRangeBounds(cfg, bounds), true
+	}
+	return nil, false
+}
+
+// timeValuesFromVitessExpr 提取 AND/OR 组合中的精确分表时间；OR 的每一支都必须可精确路由。
+func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key string) ([]time.Time, bool) {
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		left, leftOK := timeValuesFromVitessExpr(e.Left, vars, key)
+		right, rightOK := timeValuesFromVitessExpr(e.Right, vars, key)
+		if !leftOK && !rightOK {
+			return nil, false
+		}
+		return append(left, right...), true
+	case *sqlparser.OrExpr:
+		left, leftOK := timeValuesFromVitessExpr(e.Left, vars, key)
+		right, rightOK := timeValuesFromVitessExpr(e.Right, vars, key)
+		if !leftOK || !rightOK {
+			return nil, false
+		}
+		return append(left, right...), true
+	case *sqlparser.ComparisonExpr:
+		if !vitessColumnMatches(e.Left, key) {
+			return nil, false
+		}
+		switch e.Operator {
+		case sqlparser.EqualOp:
+			return timeValuesFromVitessValue(e.Right, vars)
+		case sqlparser.InOp:
+			return timeValuesFromVitessValue(e.Right, vars)
 		}
 	}
-	if !start.IsZero() && !end.IsZero() {
-		return start, end, true
+	return nil, false
+}
+
+// timeRangeBoundsFromVitessExpr 仅接受 AND 组合的范围条件，避免 OR 条件被错误缩窄。
+func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key string) (timeRangeBounds, bool) {
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		left, leftOK := timeRangeBoundsFromVitessExpr(e.Left, vars, key)
+		right, rightOK := timeRangeBoundsFromVitessExpr(e.Right, vars, key)
+		if !leftOK && !rightOK {
+			return timeRangeBounds{}, false
+		}
+		if !leftOK {
+			return right, true
+		}
+		if !rightOK {
+			return left, true
+		}
+		if !right.start.IsZero() {
+			left.start = right.start
+		}
+		if !right.end.IsZero() {
+			left.end = right.end
+			left.endExclusive = right.endExclusive
+		}
+		return left, true
+	case *sqlparser.BetweenExpr:
+		if !e.IsBetween || !vitessColumnMatches(e.Left, key) {
+			return timeRangeBounds{}, false
+		}
+		start, startOK := timeFromVitessValue(e.From, vars)
+		end, endOK := timeFromVitessValue(e.To, vars)
+		if !startOK || !endOK {
+			return timeRangeBounds{}, false
+		}
+		return timeRangeBounds{start: start, end: end}, true
+	case *sqlparser.ComparisonExpr:
+		if !vitessColumnMatches(e.Left, key) {
+			return timeRangeBounds{}, false
+		}
+		value, ok := timeFromVitessValue(e.Right, vars)
+		if !ok {
+			return timeRangeBounds{}, false
+		}
+		switch e.Operator {
+		case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp:
+			return timeRangeBounds{start: value}, true
+		case sqlparser.LessThanOp:
+			return timeRangeBounds{end: value, endExclusive: true}, true
+		case sqlparser.LessEqualOp:
+			return timeRangeBounds{end: value}, true
+		}
 	}
-	return time.Time{}, time.Time{}, false
+	return timeRangeBounds{}, false
+}
+
+// vitessColumnMatches 判断 Vitess AST 中的列是否等于分表字段。
+func vitessColumnMatches(expr sqlparser.Expr, key string) bool {
+	column, ok := expr.(*sqlparser.ColName)
+	return ok && normalizeColumnName(column.Name.String()) == normalizeColumnName(key)
+}
+
+// timeValuesFromVitessValue 从 AST 值表达式中读取一个或多个绑定时间参数。
+func timeValuesFromVitessValue(expr sqlparser.Expr, vars []interface{}) ([]time.Time, bool) {
+	if value, ok := timeFromVitessValue(expr, vars); ok {
+		return []time.Time{value}, true
+	}
+	if argument, ok := expr.(*sqlparser.Argument); ok {
+		if index, ok := vitessArgumentIndex(argument, len(vars)); ok {
+			return asTimes(vars[index])
+		}
+	}
+	tuple, ok := expr.(sqlparser.ValTuple)
+	if !ok {
+		return nil, false
+	}
+	out := make([]time.Time, 0, len(tuple))
+	for _, item := range tuple {
+		values, ok := timeValuesFromVitessValue(item, vars)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, values...)
+	}
+	return out, len(out) > 0
+}
+
+// timeFromVitessValue 根据 Vitess 自动生成的 v1、v2 占位符读取 GORM 参数。
+func timeFromVitessValue(expr sqlparser.Expr, vars []interface{}) (time.Time, bool) {
+	argument, ok := expr.(*sqlparser.Argument)
+	if !ok {
+		return time.Time{}, false
+	}
+	index, ok := vitessArgumentIndex(argument, len(vars))
+	if !ok {
+		return time.Time{}, false
+	}
+	return asTime(vars[index])
+}
+
+// vitessArgumentIndex 把 Vitess 自动生成的 v1、v2 占位符转换为 GORM 参数下标。
+func vitessArgumentIndex(argument *sqlparser.Argument, length int) (int, bool) {
+	if !strings.HasPrefix(argument.Name, "v") {
+		return 0, false
+	}
+	index, err := strconv.Atoi(strings.TrimPrefix(argument.Name, "v"))
+	if err != nil || index <= 0 || index > length {
+		return 0, false
+	}
+	return index - 1, true
 }
 
 // columnMatches 判断 GORM 条件里的列名是否等于分表字段。
@@ -344,10 +481,15 @@ func columnCandidates(key string) []string {
 	}
 }
 
-// tablesForRange 根据时间范围倒推出最多 MaxScanTables 张真实分表。
-func tablesForRange(cfg ShardingConfig, start, end time.Time) []string {
+// tablesForRangeBounds 根据时间范围倒推出最多 MaxScanTables 张真实分表。
+func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
+	start, end := bounds.start, bounds.end
 	if end.Before(start) {
 		start, end = end, start
+	}
+	if bounds.endExclusive && cfg.tableName(end) != cfg.tableName(end.Add(-time.Nanosecond)) {
+		// 上界恰好位于下一个分片起点时，该分片不属于 [start, end)。
+		end = end.Add(-time.Nanosecond)
 	}
 	out := make([]string, 0)
 	seen := make(map[string]struct{})

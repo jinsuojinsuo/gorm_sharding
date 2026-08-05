@@ -361,7 +361,7 @@ db.AutoMigrate(&User{})
 插件自动：
 
 ```
-扫描所有分表
+扫描最近 MaxScanTables 张分表
 
 ↓
 
@@ -374,7 +374,7 @@ AutoMigrate(User{})
 
 结果：
 
-所有历史表增加字段。
+最近 MaxScanTables 张历史表增加字段。
 
 
 ---
@@ -626,6 +626,12 @@ LIMIT 20
 
 每个分表先取Top N，避免全表扫描。
 
+支持 Offset：每张分表先取 `Offset + Limit` 行，外层再统一执行原 Offset 和 Limit。
+
+跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、SUM、MIN、MAX、AVG 按全部命中分表的数据计算。
+
+限制：只支持单模型、无 Join 的 GORM 查询；Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。
+
 
 ---
 
@@ -758,6 +764,8 @@ join order
 原因：
 
 多分表Join组合复杂。
+
+Raw/Exec 只支持目标明确的一张真实分表。条件命中多张分表时返回错误，不通过 `multiStatements=true` 拼接多条 SQL 执行。
 
 
 ---
@@ -934,8 +942,6 @@ utils/
 不支持：
 
 - Join跨分表
-- Group By跨分表
-- 聚合函数跨分表
 - SQL表达式分表字段计算
 - 多数据库
 

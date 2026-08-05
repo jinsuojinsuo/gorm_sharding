@@ -131,8 +131,8 @@ func (m *tableManager) existingTables(cfg ShardingConfig) ([]string, error) {
 	var tables []string
 	// 按表名倒序取最近分表；当前策略的表名后缀都按时间递增，倒序就是从新到旧。
 	err := m.db.Raw(
-		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ORDER BY TABLE_NAME DESC LIMIT ?",
-		cfg.tablePrefix+"_%", cfg.MaxScanTables,
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
+		tableNameLikePattern(cfg.tablePrefix), cfg.MaxScanTables,
 	).Scan(&tables).Error
 	if err != nil {
 		return tables, err
@@ -142,6 +142,12 @@ func (m *tableManager) existingTables(cfg ShardingConfig) ([]string, error) {
 		m.seen.Store(table, struct{}{})
 	}
 	return tables, err
+}
+
+// tableNameLikePattern 转义逻辑表名里的 LIKE 通配符，并匹配其真实分表后缀。
+func tableNameLikePattern(prefix string) string {
+	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(prefix)
+	return escaped + "\\_%"
 }
 
 // autoMigrate 对已经存在的历史分表逐张执行 GORM AutoMigrate。

@@ -41,8 +41,25 @@ func (Order) TableName() string {
 	return "order"
 }
 
+var MysqlUser = os.Getenv("MYSQL_USER")
+var password = os.Getenv("MYSQL_PASSWORD")
+
 // main 演示插件注册、自动迁移、增删改查和 Raw 查询的基本用法。
 func main() {
+	if MysqlUser == "" {
+		fmt.Println("请出入mysql用户名")
+		if _, err := fmt.Scanf("%s", &MysqlUser); err != nil {
+			panic(err)
+		}
+	}
+
+	if password == "" {
+		fmt.Println("请出入mysql密码")
+		if _, err := fmt.Scanf("%s", &password); err != nil {
+			panic(err)
+		}
+	}
+
 	db := connectMysql()
 
 	plugin := gorm_sharding.New()
@@ -161,7 +178,7 @@ func connectMysql() *gorm.DB {
 		},
 	)
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local", "game", "qifan515", "127.0.0.1", 3306, "test")
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local", MysqlUser, password, "127.0.0.1", 3306, "test")
 	db, err := gorm.Open(mysql.New(mysql.Config{
 		DriverName: "mysql",
 		DSN:        dsn,

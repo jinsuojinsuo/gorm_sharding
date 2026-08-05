@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/callbacks"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
 )
@@ -47,6 +46,11 @@ func (p *Plugin) Name() string {
 
 // Register 注册模型和对应分表配置。
 func (p *Plugin) Register(model interface{}, cfg ShardingConfig) error {
+	p.initMu.Lock()
+	defer p.initMu.Unlock()
+	if p.initialized {
+		return fmt.Errorf("gorm_sharding: register must happen before db.Use")
+	}
 	if err := cfg.validate(); err != nil {
 		return err
 	}
@@ -115,7 +119,7 @@ func (p *Plugin) resolveTablePrefixes(db *gorm.DB) error {
 	return nil
 }
 
-// AutoMigrate 迁移已注册模型的历史分表，不创建逻辑模板表。
+// AutoMigrate 迁移已注册模型最近 MaxScanTables 张历史分表，不创建逻辑模板表。
 func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	for _, model := range models {
 		cfg, ok := p.configs[modelKey(model)]
@@ -175,6 +179,18 @@ func (p *Plugin) create(db *gorm.DB) {
 			// 单分表插入只替换当前 Statement 的表名，后续交给 GORM 原始 create 回调。
 			setStatementTable(db, table)
 			p.createFn(db)
+			if isMissingTableError(db.Error) && cfg.AutoCreateTable {
+				// 表在存在性缓存命中后被外部删除时，清理缓存、重建一次并重试本次写入。
+				p.manager.invalidate(cfg, table)
+				if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+					db.AddError(err)
+					return
+				}
+				db.Error = nil
+				db.Statement.SQL.Reset()
+				db.Statement.Vars = nil
+				p.createFn(db)
+			}
 			return
 		}
 	}
@@ -187,8 +203,11 @@ func (p *Plugin) create(db *gorm.DB) {
 		}
 		// 批量数据可能分散到多张表，必须拆成多次 Create，并累加 RowsAffected。
 		// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
-		tx := db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Set(skipKey, true).Table(table)
-		res := createShardValues(tx, values.Interface())
+		res, err := p.createShardValues(db, cfg, table, values.Interface())
+		if err != nil {
+			db.AddError(err)
+			return
+		}
 		if err := res.Error; err != nil {
 			db.AddError(err)
 			return
@@ -199,6 +218,26 @@ func (p *Plugin) create(db *gorm.DB) {
 	if db.Statement.Result != nil {
 		db.Statement.Result.RowsAffected = rows
 	}
+}
+
+// createShardValues 执行单个真实分表的内部插入，并在缓存表被外部删除时恢复一次。
+func (p *Plugin) createShardValues(db *gorm.DB, cfg ShardingConfig, table string, values interface{}) (*gorm.DB, error) {
+	create := func() *gorm.DB {
+		tx := db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Table(table)
+		copyCreateState(tx, db)
+		tx = tx.Set(skipKey, true)
+		return createShardValues(tx, values)
+	}
+
+	res := create()
+	if !isMissingTableError(res.Error) || !cfg.AutoCreateTable {
+		return res, nil
+	}
+	p.manager.invalidate(cfg, table)
+	if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+		return nil, err
+	}
+	return create(), nil
 }
 
 // createShardValues 执行单个真实分表的插入。
@@ -250,15 +289,29 @@ func (p *Plugin) query(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
-	if _, ok := db.Statement.Clauses["GROUP BY"]; ok {
-		db.AddError(fmt.Errorf("gorm_sharding: group query is not supported"))
+	if isAggregateQuery(db) {
+		if err := p.executeCombinedQuery(db, tables); err != nil {
+			db.AddError(err)
+		}
 		return
 	}
-	if _, ok := db.Statement.Clauses["ORDER BY"]; ok {
-		if _, hasLimit := db.Statement.Clauses["LIMIT"]; hasLimit {
-			db.AddError(fmt.Errorf("gorm_sharding: order with limit across shards is not supported"))
-			return
+	if _, hasGroup := db.Statement.Clauses["GROUP BY"]; hasGroup {
+		if err := p.executeCombinedQuery(db, tables); err != nil {
+			db.AddError(err)
 		}
+		return
+	}
+	if _, hasLimit := db.Statement.Clauses["LIMIT"]; hasLimit {
+		if err := p.executeCombinedQuery(db, tables); err != nil {
+			db.AddError(err)
+		}
+		return
+	}
+	if _, hasOrder := db.Statement.Clauses["ORDER BY"]; hasOrder {
+		if err := p.executeCombinedQuery(db, tables); err != nil {
+			db.AddError(err)
+		}
+		return
 	}
 	scanInto := db.Statement.Dest
 	dst := reflect.ValueOf(scanInto)
@@ -395,7 +448,7 @@ func (p *Plugin) raw(db *gorm.DB) {
 		db.Statement.SQL.Reset()
 		db.Statement.SQL.WriteString(sql)
 	}
-	callbacks.RawExec(db)
+	p.rawFn(db)
 }
 
 // row 处理 db.Raw(...).Scan/Rows/Row 这类走 Row 回调的 SQL 改写。
@@ -410,7 +463,39 @@ func (p *Plugin) row(db *gorm.DB) {
 			db.Statement.SQL.Reset()
 			db.Statement.SQL.WriteString(sql)
 		}
+		p.rowFn(db)
+		return
 	}
+
+	cfg, ok := p.configFor(db)
+	if !ok {
+		p.rowFn(db)
+		return
+	}
+	tables := p.routeTables(db, cfg)
+	if len(tables) <= 1 {
+		if len(tables) == 1 {
+			setStatementTable(db, tables[0])
+		}
+		p.rowFn(db)
+		return
+	}
+	if len(db.Statement.Joins) > 0 {
+		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
+		return
+	}
+	if !isAggregateQuery(db) && !hasGroupBy(db) {
+		db.AddError(fmt.Errorf("gorm_sharding: cross table row query must be aggregate or group query"))
+		return
+	}
+	sql, vars, err := p.buildCombinedQuery(db, tables)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
+	db.Statement.SQL.Reset()
+	db.Statement.SQL.WriteString(sql)
+	db.Statement.Vars = vars
 	p.rowFn(db)
 }
 

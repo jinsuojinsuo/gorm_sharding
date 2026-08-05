@@ -19,3 +19,12 @@ func copyWriteState(dst, src *gorm.DB) {
 	copyQueryState(dst, src)
 	dst.Statement.Dest = src.Statement.Dest
 }
+
+// copyCreateState 复制跨分表内部插入需要保留的用户配置。
+func copyCreateState(dst, src *gorm.DB) {
+	// OnConflict、Select 和 Omit 都记录在 Statement 中；拆分插入时必须继续生效。
+	dst.Statement.Clauses = src.Statement.Clauses
+	dst.Statement.Selects = src.Statement.Selects
+	dst.Statement.Omits = src.Statement.Omits
+	dst.Statement.Settings = src.Statement.Settings
+}

@@ -372,7 +372,7 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 		AutoCreateTable: true,
 		AutoMigrate:     true,
 	}
-	manager := newTableManager(rawDB)
+	manager := newTableManager()
 	oldHour := time.Date(2026, 8, 4, 16, 0, 0, 0, time.Local)
 	newHour := oldHour.Add(time.Hour)
 	oldTables := []string{cfg.tableName(oldHour), cfg.tableName(oldHour.Add(-time.Hour))}
@@ -382,21 +382,21 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 		}
 	}
 
-	oldList := manager.tables(cfg, oldHour)
+	oldList := manager.tables(rawDB, cfg, oldHour)
 	if !sameStrings(oldList, oldTables) {
 		t.Fatalf("old shard list = %v, want %v", oldList, oldTables)
 	}
 
 	newTable := cfg.tableName(newHour)
-	warmedBeforeCreate := manager.tables(cfg, newHour)
+	warmedBeforeCreate := manager.tables(rawDB, cfg, newHour)
 	if containsString(warmedBeforeCreate, newTable) {
 		t.Fatalf("new shard %s should not be listed before it is created", newTable)
 	}
 
-	if err := manager.ensure(&requirementUser{}, cfg, newTable); err != nil {
+	if err := manager.ensure(rawDB, &requirementUser{}, cfg, newTable); err != nil {
 		t.Fatalf("ensure new shard at boundary failed: %v", err)
 	}
-	afterCreate := manager.tables(cfg, newHour)
+	afterCreate := manager.tables(rawDB, cfg, newHour)
 	if len(afterCreate) == 0 || afterCreate[0] != newTable {
 		t.Fatalf("new shard list after boundary create = %v, want first table %s", afterCreate, newTable)
 	}

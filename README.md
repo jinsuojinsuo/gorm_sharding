@@ -150,6 +150,7 @@ err = db.Session(&gorm.Session{CreateBatchSize: 1000}).Create(&users).Error
 2. 跨真实分表的数据会先按目标表拆分，再分别执行插入。
 3. `RowsAffected` 会累加所有真实分表的影响行数。
 4. 分表字段必须能从每条记录中取到 `time.Time` 值，否则会返回错误。
+5. `Create` 不能通过 `Select` 或 `Omit` 省略分表字段；`OnConflict` 也不能更新分表字段。两类操作都会返回错误，避免记录时间与物理分表不一致。
 
 ### 精确查询
 
@@ -177,6 +178,8 @@ err := db.Where("name = ?", "alice").Find(&users).Error
 ### 跨分表聚合
 
 跨分表 `Count`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By`、`Having` 会由 MySQL 执行全局查询：插件使用 `UNION ALL` 合并各真实分表的原始行，再在外层保留原始 SQL 的 `SELECT`、聚合、分组、排序和分页。
+
+跨分表普通 GORM 查询不支持子查询，包括相关子查询、`EXISTS` 和派生表；会返回 `gorm_sharding: subquery across shards is not supported`。单分表查询不受此限制。
 
 对于单模型、单逻辑表且不包含 Join 的查询，`Find` 和 `Scan` 的结果可保持与单表 MySQL 查询一致，包括 `NULL` 语义、`COUNT(DISTINCT ...)`、加权 `AVG`、数据库排序规则和 `HAVING`。
 
@@ -368,9 +371,9 @@ go test ./... -run TestRequirement -count=1 -v
 5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行；`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
-9. 子查询可访问普通非分表表，但不能引用已注册的逻辑分表；Raw SQL 与 GORM 查询都不会递归改写子查询中的逻辑表名。
+9. Raw SQL 的子查询可访问普通非分表表，但不能引用已注册的逻辑分表。跨分表普通 GORM 查询不支持任何子查询，包括相关子查询、`EXISTS` 和派生表；单分表 GORM 查询不受此限制。
 10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
-11. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界，插件会在初始化 DB 连接上创建表；请在事务开始前预建目标分表。
+11. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界；请在事务开始前预建目标分表。建表和元数据读取会继承当前调用的连接配置与 Context。
 12. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
 
 ## 性能说明

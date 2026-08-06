@@ -73,7 +73,7 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 		return err
 	}
 
-	p.manager = newTableManager(db)
+	p.manager = newTableManager()
 
 	// Replace 之前先取出原始回调；后续插件回调内部会在改完表名后调用它们。
 	p.createFn = db.Callback().Create().Get("gorm:create")
@@ -174,6 +174,14 @@ func (p *Plugin) create(db *gorm.DB) {
 		p.createFn(db)
 		return
 	}
+	if !createIncludesShardingKey(db, cfg) {
+		db.AddError(fmt.Errorf("gorm_sharding: create must include sharding key %s", cfg.ShardingKey))
+		return
+	}
+	if createUpdatesShardingKey(db, cfg) {
+		db.AddError(fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey))
+		return
+	}
 
 	groups, err := p.groupCreateValues(db, cfg)
 	if err != nil {
@@ -188,7 +196,7 @@ func (p *Plugin) create(db *gorm.DB) {
 			if isMissingTableError(db.Error) && cfg.AutoCreateTable {
 				// 表在存在性缓存命中后被外部删除时，清理缓存、重建一次并重试本次写入。
 				p.manager.invalidate(cfg, table)
-				if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+				if err := p.manager.ensure(db, db.Statement.Model, cfg, table); err != nil {
 					db.AddError(err)
 					return
 				}
@@ -236,7 +244,7 @@ func (p *Plugin) createShardValues(db *gorm.DB, cfg ShardingConfig, table string
 		return res, nil
 	}
 	p.manager.invalidate(cfg, table)
-	if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
+	if err := p.manager.ensure(db, db.Statement.Model, cfg, table); err != nil {
 		return nil, err
 	}
 	return create(), nil
@@ -599,7 +607,7 @@ func (p *Plugin) executeEmptyRowRead(db *gorm.DB, cfg ShardingConfig) error {
 
 	// Rows() 会把 *sql.Rows 交给调用方，Columns() 必须与原始 SELECT 一致。
 	// 因此不能使用虚拟 SELECT，而要在一张确认存在的真实分表执行原 WHERE 条件。
-	tables, err := p.manager.existingTables(cfg)
+	tables, err := p.manager.existingTables(db, cfg)
 	if err != nil {
 		return fmt.Errorf("gorm_sharding: find existing shard for empty Rows: %w", err)
 	}
@@ -614,7 +622,7 @@ func (p *Plugin) executeEmptyRowRead(db *gorm.DB, cfg ShardingConfig) error {
 	}
 
 	// 元数据查询与执行之间表可能被外部删除。清理缓存后只重试一次，仍不存在则明确报错。
-	retryTables := p.manager.existingAfterMissing(cfg, tables)
+	retryTables := p.manager.existingAfterMissing(db, cfg, tables)
 	if len(retryTables) == 0 {
 		return fmt.Errorf("gorm_sharding: empty Rows requires an existing shard")
 	}
@@ -667,7 +675,7 @@ func (p *Plugin) routeReadTables(db *gorm.DB, cfg ShardingConfig) []string {
 			return tables
 		}
 	}
-	return p.manager.tables(cfg, time.Now())
+	return p.manager.tables(db, cfg, time.Now())
 }
 
 // routeWriteTables 根据写入模型或 WHERE 条件计算 Update、Delete 的真实分表列表。

@@ -17,7 +17,7 @@ func (p *Plugin) executeRawWriteAcrossShards(db *gorm.DB) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
-	cfg, targets, ok, err := p.rawWriteTargets(stmt, db.Statement.Vars)
+	cfg, targets, ok, err := p.rawWriteTargets(db, stmt, db.Statement.Vars)
 	if err != nil || !ok || len(targets) <= 1 {
 		return ok && err != nil, err
 	}
@@ -89,7 +89,7 @@ func rawWriteHasLimit(stmt sqlparser.Statement) bool {
 }
 
 // rawWriteTargets 返回 Raw UPDATE 或 DELETE 的分表配置和所有目标真实表。
-func (p *Plugin) rawWriteTargets(stmt sqlparser.Statement, vars []interface{}) (ShardingConfig, []string, bool, error) {
+func (p *Plugin) rawWriteTargets(db *gorm.DB, stmt sqlparser.Statement, vars []interface{}) (ShardingConfig, []string, bool, error) {
 	var table sqlparser.TableName
 	var update *sqlparser.Update
 	switch statement := stmt.(type) {
@@ -133,7 +133,7 @@ func (p *Plugin) rawWriteTargets(stmt sqlparser.Statement, vars []interface{}) (
 	}
 	targets, routed := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
 	if !routed {
-		targets = p.manager.tables(cfg, time.Now())
+		targets = p.manager.tables(db, cfg, time.Now())
 	}
 	if len(targets) == 0 {
 		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: no target table for %s", table.Name.String())
@@ -204,7 +204,7 @@ func (p *Plugin) rewriteRawSQL(db *gorm.DB) (string, bool, error) {
 		return "", false, err
 	}
 
-	changed, err := p.rewriteStatementTable(stmt, db.Statement.Vars)
+	changed, err := p.rewriteStatementTable(db, stmt, db.Statement.Vars)
 	if err != nil {
 		return "", false, err
 	}
@@ -216,24 +216,24 @@ func (p *Plugin) rewriteRawSQL(db *gorm.DB) (string, bool, error) {
 }
 
 // rewriteStatementTable 根据 SQL 语句类型定位需要改写的主表。
-func (p *Plugin) rewriteStatementTable(stmt sqlparser.Statement, vars []interface{}) (bool, error) {
+func (p *Plugin) rewriteStatementTable(db *gorm.DB, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
 	// v1 只改写单表 SELECT/INSERT/UPDATE/DELETE 的主表名；Join 和复杂子查询先保持原样。
 	switch s := stmt.(type) {
 	case *sqlparser.Select:
-		return p.rewriteTableExprs(s.From, stmt, vars)
+		return p.rewriteTableExprs(db, s.From, stmt, vars)
 	case *sqlparser.Insert:
-		return p.rewriteAliasedTable(s.Table, stmt, vars)
+		return p.rewriteAliasedTable(db, s.Table, stmt, vars)
 	case *sqlparser.Update:
-		return p.rewriteTableExprs(s.TableExprs, stmt, vars)
+		return p.rewriteTableExprs(db, s.TableExprs, stmt, vars)
 	case *sqlparser.Delete:
-		return p.rewriteTableExprs(s.TableExprs, stmt, vars)
+		return p.rewriteTableExprs(db, s.TableExprs, stmt, vars)
 	default:
 		return false, nil
 	}
 }
 
 // rewriteTableExprs 改写 SELECT/UPDATE/DELETE 中的单个 table expression。
-func (p *Plugin) rewriteTableExprs(exprs []sqlparser.TableExpr, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
+func (p *Plugin) rewriteTableExprs(db *gorm.DB, exprs []sqlparser.TableExpr, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
 	if len(exprs) != 1 {
 		return false, nil
 	}
@@ -241,11 +241,11 @@ func (p *Plugin) rewriteTableExprs(exprs []sqlparser.TableExpr, stmt sqlparser.S
 	if !ok {
 		return false, nil
 	}
-	return p.rewriteAliasedTable(aliased, stmt, vars)
+	return p.rewriteAliasedTable(db, aliased, stmt, vars)
 }
 
 // rewriteAliasedTable 改写带别名的表表达式中的真实表名。
-func (p *Plugin) rewriteAliasedTable(aliased *sqlparser.AliasedTableExpr, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
+func (p *Plugin) rewriteAliasedTable(db *gorm.DB, aliased *sqlparser.AliasedTableExpr, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
 	if aliased == nil {
 		return false, nil
 	}
@@ -253,7 +253,7 @@ func (p *Plugin) rewriteAliasedTable(aliased *sqlparser.AliasedTableExpr, stmt s
 	if !ok {
 		return false, nil
 	}
-	changed, err := p.rewriteTableName(&table, stmt, vars)
+	changed, err := p.rewriteTableName(db, &table, stmt, vars)
 	if changed {
 		aliased.Expr = table
 	}
@@ -261,7 +261,7 @@ func (p *Plugin) rewriteAliasedTable(aliased *sqlparser.AliasedTableExpr, stmt s
 }
 
 // rewriteTableName 把 AST 中的逻辑表名替换成当前策略选出的真实分表名。
-func (p *Plugin) rewriteTableName(table *sqlparser.TableName, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
+func (p *Plugin) rewriteTableName(db *gorm.DB, table *sqlparser.TableName, stmt sqlparser.Statement, vars []interface{}) (bool, error) {
 	name := table.Name.String()
 	cfg, ok := p.configByPrefix(name)
 	if !ok {
@@ -280,7 +280,7 @@ func (p *Plugin) rewriteTableName(table *sqlparser.TableName, stmt sqlparser.Sta
 	}
 	if !routed {
 		// 无分表字段条件时保留 Raw 单表默认查询最新真实分表的行为。
-		targets = p.manager.tables(cfg, time.Now())
+		targets = p.manager.tables(db, cfg, time.Now())
 	}
 	if len(targets) == 0 {
 		return false, fmt.Errorf("gorm_sharding: no target table for %s", name)

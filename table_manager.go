@@ -15,8 +15,6 @@ import (
 
 // tableManager 负责真实分表的存在性检查、创建、扫描和历史表迁移。
 type tableManager struct {
-	db *gorm.DB
-
 	// seen 缓存已经确认存在的真实分表，避免循环内重复 HasTable。
 	seen sync.Map
 
@@ -28,16 +26,16 @@ type tableManager struct {
 }
 
 // newTableManager 创建表管理器实例。
-func newTableManager(db *gorm.DB) *tableManager {
-	return &tableManager{db: db}
+func newTableManager() *tableManager {
+	return &tableManager{}
 }
 
 // exists 判断真实分表是否存在；已经确认存在的表会缓存，避免循环扫描时反复查 information_schema。
-func (m *tableManager) exists(table string) bool {
+func (m *tableManager) exists(db *gorm.DB, table string) bool {
 	if _, ok := m.seen.Load(table); ok {
 		return true
 	}
-	if !m.db.Migrator().HasTable(table) {
+	if !db.Migrator().HasTable(table) {
 		return false
 	}
 	m.seen.Store(table, struct{}{})
@@ -51,7 +49,7 @@ func (m *tableManager) invalidate(cfg ShardingConfig, table string) {
 }
 
 // existingAfterMissing 在 SQL 返回 1146 后刷新候选表缓存，并返回仍然存在的真实分表。
-func (m *tableManager) existingAfterMissing(cfg ShardingConfig, candidates []string) []string {
+func (m *tableManager) existingAfterMissing(db *gorm.DB, cfg ShardingConfig, candidates []string) []string {
 	for _, table := range candidates {
 		m.seen.Delete(table)
 	}
@@ -59,7 +57,7 @@ func (m *tableManager) existingAfterMissing(cfg ShardingConfig, candidates []str
 
 	existing := make([]string, 0, len(candidates))
 	for _, table := range candidates {
-		if m.exists(table) {
+		if m.exists(db, table) {
 			existing = append(existing, table)
 		}
 	}
@@ -73,19 +71,19 @@ func isMissingTableError(err error) bool {
 }
 
 // ensure 确保指定真实分表存在；开启 AutoCreateTable 时会用 GORM AutoMigrate 建表。
-func (m *tableManager) ensure(model interface{}, cfg ShardingConfig, table string) error {
+func (m *tableManager) ensure(db *gorm.DB, model interface{}, cfg ShardingConfig, table string) error {
 	if !cfg.AutoCreateTable {
 		return nil
 	}
-	if m.exists(table) {
+	if m.exists(db, table) {
 		return nil
 	}
 	_, err, _ := m.createGroup.Do(table, func() (interface{}, error) {
-		if m.exists(table) {
+		if m.exists(db, table) {
 			return nil, nil
 		}
 		// 不手写 CREATE TABLE，直接让 GORM AutoMigrate 根据 struct 和 tag 创建真实分表。
-		if err := m.db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
+		if err := db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
 			return nil, err
 		}
 		m.seen.Store(table, struct{}{})
@@ -96,13 +94,13 @@ func (m *tableManager) ensure(model interface{}, cfg ShardingConfig, table strin
 }
 
 // tables 返回无精确分表条件时需要扫描的最近分表列表。
-func (m *tableManager) tables(cfg ShardingConfig, now time.Time) []string {
+func (m *tableManager) tables(db *gorm.DB, cfg ShardingConfig, now time.Time) []string {
 	cacheKey := m.tableListCacheKey(cfg, now)
 	if cached, ok := m.tableLists.Load(cacheKey); ok {
 		return cloneStrings(cached.([]string))
 	}
 
-	tables, err := m.existingTables(cfg)
+	tables, err := m.existingTables(db, cfg)
 	if err == nil && len(tables) > 0 {
 		if len(tables) > cfg.MaxScanTables {
 			tables = tables[:cfg.MaxScanTables]
@@ -139,14 +137,14 @@ func (m *tableManager) clearTableListCache(cfg ShardingConfig) {
 }
 
 // existingTables 从 MySQL information_schema 查询已经存在的真实分表。
-func (m *tableManager) existingTables(cfg ShardingConfig) ([]string, error) {
-	if m.db.Dialector.Name() != "mysql" {
+func (m *tableManager) existingTables(db *gorm.DB, cfg ShardingConfig) ([]string, error) {
+	if db.Dialector.Name() != "mysql" {
 		return nil, fmt.Errorf("gorm_sharding: only mysql table scan is supported")
 	}
 
 	var tables []string
 	// 按表名倒序取最近分表；当前策略的表名后缀都按时间递增，倒序就是从新到旧。
-	err := m.db.Raw(
+	err := db.Raw(
 		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
 		tableNameLikePattern(cfg.tablePrefix), cfg.MaxScanTables,
 	).Scan(&tables).Error
@@ -171,7 +169,7 @@ func (m *tableManager) autoMigrate(db *gorm.DB, model interface{}, cfg ShardingC
 	if db == nil {
 		return fmt.Errorf("gorm_sharding: AutoMigrate database is nil")
 	}
-	tables, err := m.existingTablesWithDB(db, cfg)
+	tables, err := m.existingTables(db, cfg)
 	if err != nil {
 		return err
 	}
@@ -182,19 +180,6 @@ func (m *tableManager) autoMigrate(db *gorm.DB, model interface{}, cfg ShardingC
 		}
 	}
 	return nil
-}
-
-// existingTablesWithDB 使用指定 DB 查询真实分表，供显式 AutoMigrate 保持调用方连接语义。
-func (m *tableManager) existingTablesWithDB(db *gorm.DB, cfg ShardingConfig) ([]string, error) {
-	if db.Dialector.Name() != "mysql" {
-		return nil, fmt.Errorf("gorm_sharding: only mysql table scan is supported")
-	}
-	var tables []string
-	err := db.Raw(
-		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
-		tableNameLikePattern(cfg.tablePrefix), cfg.MaxScanTables,
-	).Scan(&tables).Error
-	return tables, err
 }
 
 // elemAt 返回指针、切片或数组中的第 i 个实际元素。

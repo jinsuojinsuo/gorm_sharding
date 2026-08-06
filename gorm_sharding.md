@@ -33,6 +33,8 @@ db.Delete(&User{}, id)
 - 支持跨分表查询
 - 保持 GORM 原有返回结果
 
+创建记录时必须实际插入分表字段；不能用 `Select`、`Omit` 省略该字段，也不能在 `OnConflict` 更新分表字段。分表字段一旦确定物理表，不支持原地修改。
+
 ---
 
 # 2. 技术要求
@@ -636,7 +638,7 @@ LIMIT 20
 
 跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、COUNT(DISTINCT)、SUM、MIN、MAX、AVG 按全部命中分表的数据计算，并保留 MySQL 的 NULL、排序规则和 HAVING 语义。
 
-限制：只支持单模型、无 Join 的 GORM 查询；Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
+限制：只支持单模型、无 Join、无子查询的 GORM 查询；跨分表时相关子查询、`EXISTS`、派生表都会返回 `gorm_sharding: subquery across shards is not supported`。Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 
 
 ---

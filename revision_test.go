@@ -251,7 +251,7 @@ func TestRawWriteLimitAcrossShardsIsRejected(t *testing.T) {
 		t.Fatalf("parse raw update: %v", err)
 	}
 
-	_, targets, handled, err := plugin.rawWriteTargets(stmt, []interface{}{start, end})
+	_, targets, handled, err := plugin.rawWriteTargets(nil, stmt, []interface{}{start, end})
 	if err != nil || !handled || len(targets) != 2 {
 		t.Fatalf("targets = %v, handled = %v, err = %v", targets, handled, err)
 	}
@@ -474,7 +474,7 @@ func TestRawJoinWriteIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse raw join update: %v", err)
 	}
-	_, _, handled, err := plugin.rawWriteTargets(stmt, []interface{}{time.Now()})
+	_, _, handled, err := plugin.rawWriteTargets(nil, stmt, []interface{}{time.Now()})
 	if !handled || err == nil {
 		t.Fatalf("raw join write handled = %v, err = %v; want handled error", handled, err)
 	}
@@ -724,6 +724,82 @@ func TestUpdateRejectsShardingKey(t *testing.T) {
 		Updates(map[string]interface{}{"created_at": day2})
 	if result.Error == nil {
 		t.Fatal("update sharding key returned nil")
+	}
+}
+
+// TestUpdateRejectsShardingKeyGoFieldName 验证 GORM Go 字段名同样不能绕过分表字段更新限制。
+func TestUpdateRejectsShardingKeyGoFieldName(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	user := requirementUser{Name: "go-field", CreatedAt: day1, UpdatedAt: day1}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	result := db.Model(&requirementUser{}).
+		Where("id = ? AND created_at = ?", user.ID, day1).
+		Updates(map[string]interface{}{"CreatedAt": day2})
+	if result.Error == nil {
+		t.Fatal("update sharding key with Go field name returned nil")
+	}
+}
+
+// TestCreateRejectsMissingShardingKey 验证 Create 不能通过 Select 或 Omit 省略分表字段。
+func TestCreateRejectsMissingShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	user := requirementUser{Name: "omit-sharding-key", CreatedAt: day, UpdatedAt: day}
+	if result := db.Omit("CreatedAt").Create(&user); result.Error == nil {
+		t.Fatal("create omitting sharding key returned nil")
+	}
+	if result := db.Select("name", "updated_at").Create(&user); result.Error == nil {
+		t.Fatal("create selecting no sharding key returned nil")
+	}
+}
+
+// TestCreateOnConflictRejectsShardingKey 验证冲突更新不能修改分表字段。
+func TestCreateOnConflictRejectsShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	user := requirementUser{Name: "upsert-sharding-key", CreatedAt: day, UpdatedAt: day}
+	result := db.Clauses(clause.OnConflict{DoUpdates: clause.AssignmentColumns([]string{"CreatedAt"})}).Create(&user)
+	if result.Error == nil {
+		t.Fatal("create on conflict updating sharding key returned nil")
+	}
+}
+
+// TestCrossShardQueryRejectsSubquery 验证跨分表组合查询拒绝子查询，避免改写限定列后改变语义。
+func TestCrossShardQueryRejectsSubquery(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create subquery rows: %v", err)
+	}
+
+	var users []requirementUser
+	result := db.Model(&requirementUser{}).
+		Select("gs_req_user.*, (SELECT COUNT(*) FROM orders WHERE orders.user_id = gs_req_user.id) AS order_count").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Find(&users)
+	if result.Error == nil || result.Error.Error() != "gorm_sharding: subquery across shards is not supported" {
+		t.Fatalf("cross-shard subquery error = %v", result.Error)
 	}
 }
 

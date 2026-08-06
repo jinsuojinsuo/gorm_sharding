@@ -40,7 +40,7 @@ func (p *Plugin) executeCombined(db *gorm.DB, cfg ShardingConfig, tables []strin
 	}
 
 	// 遵循“先执行 SQL”的策略：只有 MySQL 返回 1146 后才读取元数据并剔除已不存在的分表。
-	retryTables := p.manager.existingAfterMissing(cfg, tables)
+	retryTables := p.manager.existingAfterMissing(db, cfg, tables)
 	if len(retryTables) == len(tables) {
 		return err
 	}
@@ -83,6 +83,9 @@ func (p *Plugin) buildCombinedQuery(db *gorm.DB, tables []string) (string, []int
 	original, ok := stmt.(*sqlparser.Select)
 	if !ok || len(original.From) != 1 {
 		return "", nil, fmt.Errorf("gorm_sharding: cross shard query must be a single table select")
+	}
+	if selectHasSubquery(original) {
+		return "", nil, fmt.Errorf("gorm_sharding: subquery across shards is not supported")
 	}
 
 	outer := sqlparser.CloneRefOfSelect(original)
@@ -221,6 +224,21 @@ func removeTableQualifiers(selectStmt *sqlparser.Select) *sqlparser.Select {
 		cursor.Replace(&copy)
 	}, nil)
 	return rewritten.(*sqlparser.Select)
+}
+
+// selectHasSubquery 判断组合查询的原始 Select 是否包含子查询。
+// 组合查询会把主表替换为派生表，相关子查询的限定列无法在不改变语义的前提下安全改写。
+func selectHasSubquery(selectStmt *sqlparser.Select) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch node.(type) {
+		case *sqlparser.Subquery, *sqlparser.DerivedTable:
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, selectStmt)
+	return found
 }
 
 // positionalVars 按 Vitess 输出的占位符顺序复制 GORM 原始参数。

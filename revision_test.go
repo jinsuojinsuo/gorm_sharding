@@ -748,6 +748,35 @@ func TestUpdateRejectsShardingKeyGoFieldName(t *testing.T) {
 	}
 }
 
+// TestPrimaryKeyWriteRequiresShardingKey 验证仅按主键的 Update/Delete 不会扫描多个可能重复主键的分表。
+func TestPrimaryKeyWriteRequiresShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	user := requirementUser{Name: "primary-key", Score: 1, CreatedAt: day, UpdatedAt: day}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	update := db.Model(&requirementUser{}).Where("id = ?", user.ID).Updates(map[string]interface{}{"score": 2})
+	if update.Error == nil || update.Error.Error() != "gorm_sharding: primary key update requires sharding key created_at" {
+		t.Fatalf("primary key update error = %v", update.Error)
+	}
+	deleteResult := db.Delete(&requirementUser{}, user.ID)
+	if deleteResult.Error == nil || deleteResult.Error.Error() != "gorm_sharding: primary key delete requires sharding key created_at" {
+		t.Fatalf("primary key delete error = %v", deleteResult.Error)
+	}
+
+	update = db.Model(&requirementUser{}).
+		Where("id = ? AND created_at = ?", user.ID, day).
+		Updates(map[string]interface{}{"score": 2})
+	if update.Error != nil || update.RowsAffected != 1 {
+		t.Fatalf("primary key update with sharding key result = %+v", update)
+	}
+}
+
 // TestCreateRejectsMissingShardingKey 验证 Create 不能通过 Select 或 Omit 省略分表字段。
 func TestCreateRejectsMissingShardingKey(t *testing.T) {
 	prefix := requirementUser{}.TableName()

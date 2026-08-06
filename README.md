@@ -269,6 +269,8 @@ db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
 
 ### 更新
 
+只包含主键的 `Update`、`Updates`、`Delete` 会返回错误；分表间主键可能重复，单条写入必须同时包含可识别的分表字段条件。
+
 ```go
 res := db.Model(&User{}).
 	Where("created_at = ? AND name = ?", createdAt, "alice").
@@ -375,6 +377,7 @@ go test ./... -run TestRequirement -count=1 -v
 10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
 11. 事务内首次写入新分表时，插件会使用初始化时保存的非事务连接创建物理表，再回到原事务执行插入。因此业务 DML 可以正常回滚，但新建的空分表会保留。元数据读取仍继承当前调用的连接配置与 Context；为避免首次写入承受 DDL 延迟，建议提前预建下一周期分表。
 12. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
+13. 普通 GORM 的 `Update`、`Updates`、`Delete` 若仅以主键定位记录且没有可识别的分表字段，会返回错误。分表间自增主键可能重复，单条写入应同时提供分表字段。
 
 ## 性能说明
 

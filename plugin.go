@@ -335,6 +335,10 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey))
 		return
 	}
+	if primaryKeyWriteWithoutShardingKey(db, cfg) {
+		db.AddError(fmt.Errorf("gorm_sharding: primary key update requires sharding key %s", cfg.ShardingKey))
+		return
+	}
 	groups, grouped, err := p.groupUpdateValues(db, cfg)
 	if err != nil {
 		db.AddError(err)
@@ -427,6 +431,10 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 	cfg, ok := p.configFor(db)
 	if !ok {
 		p.deleteFn(db)
+		return
+	}
+	if primaryKeyWriteWithoutShardingKey(db, cfg) {
+		db.AddError(fmt.Errorf("gorm_sharding: primary key delete requires sharding key %s", cfg.ShardingKey))
 		return
 	}
 	groups, grouped, err := p.groupDeleteValues(db, cfg)

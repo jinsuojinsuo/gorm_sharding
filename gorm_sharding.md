@@ -21,7 +21,7 @@ db.Model(&User{}).
    Where(...).
    Updates(...)
 
-db.Delete(&User{}, id)
+db.Where("id=? AND created_at=?", id, createdAt).Delete(&User{})
 ```
 
 插件自动完成：
@@ -693,6 +693,8 @@ RowsAffected：
 批量实体更新会按每条模型实体的分表字段分组后逐表执行，避免不同分表的主键条件互相影响。
 
 跨分表 Update、Delete 不支持 `Limit`。逐表执行会把单表的全局限制放大为每张表各自限制，插件返回 `gorm_sharding: limit across shards is not supported`。
+
+只包含主键的 Update、Delete 不会扫描多个分表，插件返回 `gorm_sharding: primary key update requires sharding key created_at` 或 `gorm_sharding: primary key delete requires sharding key created_at`。分表间主键可能重复，单条写入必须同时提供可识别的分表字段条件。
 
 
 ---

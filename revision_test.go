@@ -233,6 +233,47 @@ func TestEqualOpenStartRangeRoutesNoTables(t *testing.T) {
 	}
 }
 
+// TestRawWriteLimitAcrossShardsIsRejected 验证 Raw 写入命中多张分表时拒绝 LIMIT 语义。
+func TestRawWriteLimitAcrossShardsIsRejected(t *testing.T) {
+	plugin := New()
+	plugin.configs[reflect.TypeOf(revisionDistinctUser{})] = ShardingConfig{
+		tablePrefix:   "user",
+		ShardingKey:   "created_at",
+		Strategy:      DayStrategy,
+		MaxScanTables: 10,
+	}
+	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 2)
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"UPDATE user SET name = 'updated' WHERE created_at >= ? AND created_at < ? LIMIT 1",
+	)
+	if err != nil {
+		t.Fatalf("parse raw update: %v", err)
+	}
+
+	_, targets, handled, err := plugin.rawWriteTargets(stmt, []interface{}{start, end})
+	if err != nil || !handled || len(targets) != 2 {
+		t.Fatalf("targets = %v, handled = %v, err = %v", targets, handled, err)
+	}
+	if !rawWriteHasLimit(stmt) {
+		t.Fatal("raw update LIMIT was not detected")
+	}
+}
+
+// TestCrossShardLockingIsDetected 验证跨分表锁定查询会识别 GORM 的 FOR 子句。
+func TestCrossShardLockingIsDetected(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	query := db.Model(&revisionDistinctUser{}).Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
+	if !hasCrossShardLocking(query) {
+		t.Fatal("FOR UPDATE locking clause was not detected")
+	}
+}
+
 // TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
 func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 	prefix := requirementUser{}.TableName()

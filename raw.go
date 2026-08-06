@@ -21,6 +21,11 @@ func (p *Plugin) executeRawWriteAcrossShards(db *gorm.DB) (bool, error) {
 	if err != nil || !ok || len(targets) <= 1 {
 		return ok && err != nil, err
 	}
+	if rawWriteHasLimit(stmt) {
+		// 多分表逐表执行 LIMIT 会把单表的全局限制放大为“每张表各 LIMIT 一次”，
+		// 无法保持单逻辑表的 UPDATE/DELETE 语义，必须明确拒绝。
+		return true, fmt.Errorf("gorm_sharding: limit across shards is not supported")
+	}
 	vars := append([]interface{}(nil), db.Statement.Vars...)
 
 	execute := func(tx *gorm.DB) (int64, error) {
@@ -69,6 +74,18 @@ func (p *Plugin) executeRawWriteAcrossShards(db *gorm.DB) (bool, error) {
 		db.Statement.Result.RowsAffected = rows
 	}
 	return true, nil
+}
+
+// rawWriteHasLimit 判断 Raw UPDATE 或 DELETE 是否携带 LIMIT 子句。
+func rawWriteHasLimit(stmt sqlparser.Statement) bool {
+	switch statement := stmt.(type) {
+	case *sqlparser.Update:
+		return statement.Limit != nil
+	case *sqlparser.Delete:
+		return statement.Limit != nil
+	default:
+		return false
+	}
 }
 
 // rawWriteTargets 返回 Raw UPDATE 或 DELETE 的分表配置和所有目标真实表。

@@ -295,6 +295,10 @@ func (p *Plugin) query(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
+	if hasCrossShardLocking(db) {
+		db.AddError(fmt.Errorf("gorm_sharding: locking across shards is not supported"))
+		return
+	}
 	// 所有跨分表读取都由 MySQL 在合并原始行后统一执行。即使查询没有显式
 	// Order 或聚合，也不能依赖 Go 追加切片来模拟数据库的结果集和 Row 回调语义。
 	if err := p.executeCombinedQuery(db, cfg, tables); err != nil {
@@ -465,6 +469,10 @@ func (p *Plugin) row(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
+	if hasCrossShardLocking(db) {
+		db.AddError(fmt.Errorf("gorm_sharding: locking across shards is not supported"))
+		return
+	}
 	// Row 回调必须提供一个真实的 *sql.Rows。跨表时使用组合 SQL，
 	// 才能让 Scan、Rows、Row 与单表 GORM 回调保持相同的返回语义。
 	if err := p.executeCombinedRow(db, cfg, tables); err != nil {
@@ -536,6 +544,12 @@ func setStatementTable(db *gorm.DB, table string) {
 	// GORM 构建 SQL 时会同时参考 Table 和 TableExpr，两者都需要切到真实分表。
 	db.Statement.Table = table
 	db.Statement.TableExpr = &clause.Expr{SQL: db.Statement.Quote(table)}
+}
+
+// hasCrossShardLocking 判断查询是否包含 GORM 的 FOR UPDATE、FOR SHARE 等锁定子句。
+func hasCrossShardLocking(db *gorm.DB) bool {
+	_, ok := db.Statement.Clauses["FOR"]
+	return ok
 }
 
 // routeReadTables 只依据 WHERE 条件计算读取操作的真实分表，不能使用查询结果对象的字段值。

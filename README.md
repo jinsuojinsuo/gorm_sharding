@@ -290,7 +290,7 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。子查询可以访问普通非分表表，但不能引用已注册的逻辑分表；插件不会递归改写子查询中的逻辑表名。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 张分表，**不保证覆盖全部历史分表**；需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
+Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。命中多张分表的 Raw `UPDATE`、`DELETE` 不支持 `LIMIT`，会返回 `gorm_sharding: limit across shards is not supported`。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。子查询可以访问普通非分表表，但不能引用已注册的逻辑分表；插件不会递归改写子查询中的逻辑表名。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 张分表，**不保证覆盖全部历史分表**；需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
 
 不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。Raw `UPDATE`、`DELETE` 的多分表执行由插件管理；跨分表读取请使用 `Find`。
 
@@ -353,7 +353,7 @@ go test ./... -run TestRequirement -count=1 -v
 2. 分表字段只支持 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`。
 3. 不支持 int 时间戳、字符串日期、SQL 表达式计算分表字段。
 4. 跨分表 Join 不支持。
-5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
+5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行；`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
 9. 子查询可访问普通非分表表，但不能引用已注册的逻辑分表；Raw SQL 与 GORM 查询都不会递归改写子查询中的逻辑表名。

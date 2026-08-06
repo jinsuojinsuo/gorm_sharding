@@ -636,7 +636,7 @@ LIMIT 20
 
 跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、COUNT(DISTINCT)、SUM、MIN、MAX、AVG 按全部命中分表的数据计算，并保留 MySQL 的 NULL、排序规则和 HAVING 语义。
 
-限制：只支持单模型、无 Join 的 GORM 查询；Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。
+限制：只支持单模型、无 Join 的 GORM 查询；Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 
 
 ---
@@ -774,6 +774,8 @@ join order
 Raw `SELECT` 只支持目标明确的一张真实分表；条件命中多张分表时返回错误。
 
 Raw `UPDATE`、`DELETE` 支持命中多张真实分表：插件从同一份 SQL AST 克隆出每张真实分表的 SQL，逐表执行并累加 `RowsAffected`，不通过 `multiStatements=true` 拼接多条 SQL。
+
+命中多张真实分表的 Raw `UPDATE`、`DELETE` 不支持 `LIMIT`。逐表执行会把单表的全局限制放大为每张表各自限制，无法保持单逻辑表语义；插件返回 `gorm_sharding: limit across shards is not supported`。
 
 Raw 写操作只支持单模型、单逻辑表。`UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。
 

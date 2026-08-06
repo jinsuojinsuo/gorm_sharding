@@ -545,6 +545,10 @@ func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
 		// 上界恰好位于下一个分片起点时，该分片不属于 [start, end)。
 		end = end.Add(-time.Nanosecond)
 	}
+	if end.Before(start) || (end.Equal(start) && bounds.endExclusive) {
+		// 排他上界调整后，>= t AND < t 这类条件同样是空集，不能回退扫描历史分表。
+		return nil
+	}
 	out := make([]string, 0)
 	seen := make(map[string]struct{})
 	cursor := end

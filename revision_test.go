@@ -274,6 +274,20 @@ func TestCrossShardLockingIsDetected(t *testing.T) {
 	}
 }
 
+// TestCrossShardWriteLimitIsRejected 验证普通 GORM 跨分表 Update/Delete 会拒绝 LIMIT。
+func TestCrossShardWriteLimitIsRejected(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	write := db.Model(&revisionDistinctUser{}).Limit(1)
+	if err := crossShardWriteLimitError(write); err == nil || err.Error() != "gorm_sharding: limit across shards is not supported" {
+		t.Fatalf("cross-shard write limit error = %v", err)
+	}
+}
+
 // TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
 func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 	prefix := requirementUser{}.TableName()

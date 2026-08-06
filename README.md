@@ -10,7 +10,7 @@
 4. 批量插入会按目标分表自动拆分。
 5. 查询只根据 `WHERE` 中的分表字段精确路由；不包含可识别分表字段时最多扫描最近 `MaxScanTables` 张表。
 6. 单模型、单逻辑表的跨分表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
-7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`。
+7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`；跨分表时不支持 `Limit`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
 9. 支持显式调用 `plugin.AutoMigrate(db, model)` 同步历史分表字段。
 10. 不创建逻辑模板表，例如只创建 `user_2026080417`，不创建 `user`。

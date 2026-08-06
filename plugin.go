@@ -342,6 +342,10 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		}
 		return
 	}
+	if err := crossShardWriteLimitError(db); err != nil {
+		db.AddError(err)
+		return
+	}
 	var rows int64
 	for _, table := range tables {
 		// Update/Delete 没有分表条件时扫描最近 N 张表，每张表独立执行并累加影响行数。
@@ -385,6 +389,10 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		if len(tables) == 1 && p.handleMissingTable(db, cfg, tables[0]) {
 			return
 		}
+		return
+	}
+	if err := crossShardWriteLimitError(db); err != nil {
+		db.AddError(err)
 		return
 	}
 	var rows int64
@@ -550,6 +558,14 @@ func setStatementTable(db *gorm.DB, table string) {
 func hasCrossShardLocking(db *gorm.DB) bool {
 	_, ok := db.Statement.Clauses["FOR"]
 	return ok
+}
+
+// crossShardWriteLimitError 拒绝跨分表 Update/Delete 的 LIMIT，避免每张分表各自应用限制。
+func crossShardWriteLimitError(db *gorm.DB) error {
+	if _, _, ok := statementLimit(db); ok {
+		return fmt.Errorf("gorm_sharding: limit across shards is not supported")
+	}
+	return nil
 }
 
 // routeReadTables 只依据 WHERE 条件计算读取操作的真实分表，不能使用查询结果对象的字段值。

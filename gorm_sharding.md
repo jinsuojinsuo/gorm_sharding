@@ -688,6 +688,8 @@ RowsAffected：
 
 所有表累加。
 
+跨分表 Update、Delete 不支持 `Limit`。逐表执行会把单表的全局限制放大为每张表各自限制，插件返回 `gorm_sharding: limit across shards is not supported`。
+
 
 ---
 

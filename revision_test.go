@@ -832,6 +832,28 @@ func TestCrossShardQueryRejectsSubquery(t *testing.T) {
 	}
 }
 
+// TestCrossShardQueryRejectsPreload 验证跨分表查询不会对分表关联静默执行不完整的预加载。
+func TestCrossShardQueryRejectsPreload(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create preload rows: %v", err)
+	}
+
+	var users []requirementUser
+	result := db.Preload("Orders").Where("created_at BETWEEN ? AND ?", day1, day2).Find(&users)
+	if result.Error == nil || result.Error.Error() != "gorm_sharding: preload across shards is not supported" {
+		t.Fatalf("cross-shard preload error = %v", result.Error)
+	}
+}
+
 // TestSaveRejectsShardingKey 验证 Save 不会隐式把记录更新到错误的物理分表。
 func TestSaveRejectsShardingKey(t *testing.T) {
 	prefix := requirementUser{}.TableName()

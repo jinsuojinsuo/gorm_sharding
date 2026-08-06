@@ -432,6 +432,31 @@ func TestRequirementCreateNewShardInsideTransaction(t *testing.T) {
 	}
 }
 
+// TestRequirementMultiShardWriteUsesInternalTransaction 验证关闭默认事务时多分表写入仍会整体回滚。
+func TestRequirementMultiShardWriteUsesInternalTransaction(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	table := prefix + "_internal_tx"
+	if err := rawDB.Exec("CREATE TABLE " + quoteIdent(table) + " (id BIGINT PRIMARY KEY)").Error; err != nil {
+		t.Fatalf("create internal transaction table: %v", err)
+	}
+
+	_, err := executeMultiShardWrite(db.Session(&gorm.Session{SkipDefaultTransaction: true}), func(tx *gorm.DB) (int64, error) {
+		if err := tx.Exec("INSERT INTO " + quoteIdent(table) + " (id) VALUES (1)").Error; err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("force multi-shard write rollback")
+	})
+	if err == nil {
+		t.Fatal("internal transaction returned nil error")
+	}
+	if got := countRows(t, rawDB, table, "1=1"); got != 0 {
+		t.Fatalf("rows after internal transaction rollback = %d, want 0", got)
+	}
+}
+
 // TestRequirementConcurrentCreateSameShard 验证切表瞬间并发首次写同一新分表时只暴露正常插入结果。
 func TestRequirementConcurrentCreateSameShard(t *testing.T) {
 	prefix := requirementUser{}.TableName()

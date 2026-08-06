@@ -209,20 +209,25 @@ func (p *Plugin) create(db *gorm.DB) {
 		}
 	}
 
-	var rows int64
-	for table, values := range groups {
-		// 批量数据可能分散到多张表，必须拆成多次 Create，并累加 RowsAffected。
-		// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
-		res, err := p.createShardValues(db, cfg, table, values.Interface())
-		if err != nil {
-			db.AddError(err)
-			return
+	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
+		var rows int64
+		for table, values := range groups {
+			// 批量数据可能分散到多张表，必须拆成多次 Create，并累加影响行数。
+			// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
+			res, err := p.createShardValues(writeDB, cfg, table, values.Interface())
+			if err != nil {
+				return 0, err
+			}
+			if err := res.Error; err != nil {
+				return 0, err
+			}
+			rows += res.RowsAffected
 		}
-		if err := res.Error; err != nil {
-			db.AddError(err)
-			return
-		}
-		rows += res.RowsAffected
+		return rows, nil
+	})
+	if err != nil {
+		db.AddError(err)
+		return
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
@@ -303,6 +308,10 @@ func (p *Plugin) query(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
+	if len(db.Statement.Preloads) > 0 {
+		db.AddError(fmt.Errorf("gorm_sharding: preload across shards is not supported"))
+		return
+	}
 	if hasCrossShardLocking(db) {
 		db.AddError(fmt.Errorf("gorm_sharding: locking across shards is not supported"))
 		return
@@ -367,22 +376,28 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		db.AddError(err)
 		return
 	}
-	var rows int64
-	for _, table := range tables {
-		// Update/Delete 没有分表条件时扫描最近 N 张表，每张表独立执行并累加影响行数。
-		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
-		copyWriteState(tx, db)
-		tx = tx.Set(skipKey, true)
-		tx = tx.Model(db.Statement.Model).Updates(db.Statement.Dest)
-		if tx.Error != nil {
-			if isMissingTableError(tx.Error) {
-				p.manager.invalidate(cfg, table)
-				continue
+	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
+		var rows int64
+		for _, table := range tables {
+			// Update/Delete 没有分表条件时扫描最近 N 张表，每张表独立执行并累加影响行数。
+			tx := writeDB.Session(&gorm.Session{NewDB: true}).Table(table)
+			copyWriteState(tx, writeDB)
+			tx = tx.Set(skipKey, true)
+			tx = tx.Model(writeDB.Statement.Model).Updates(writeDB.Statement.Dest)
+			if tx.Error != nil {
+				if isMissingTableError(tx.Error) {
+					p.manager.invalidate(cfg, table)
+					continue
+				}
+				return 0, tx.Error
 			}
-			db.AddError(tx.Error)
-			return
+			rows += tx.RowsAffected
 		}
-		rows += tx.RowsAffected
+		return rows, nil
+	})
+	if err != nil {
+		db.AddError(err)
+		return
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
@@ -407,18 +422,24 @@ func (p *Plugin) execUpdateGroups(db *gorm.DB, cfg ShardingConfig, groups map[st
 		return
 	}
 
-	var rows int64
-	for table, values := range groups {
-		tx := p.updateShardValues(db, table, values.Interface())
-		if tx.Error != nil {
-			if isMissingTableError(tx.Error) {
-				p.manager.invalidate(cfg, table)
-				continue
+	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
+		var rows int64
+		for table, values := range groups {
+			tx := p.updateShardValues(writeDB, table, values.Interface())
+			if tx.Error != nil {
+				if isMissingTableError(tx.Error) {
+					p.manager.invalidate(cfg, table)
+					continue
+				}
+				return 0, tx.Error
 			}
-			db.AddError(tx.Error)
-			return
+			rows += tx.RowsAffected
 		}
-		rows += tx.RowsAffected
+		return rows, nil
+	})
+	if err != nil {
+		db.AddError(err)
+		return
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
@@ -465,22 +486,28 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		db.AddError(err)
 		return
 	}
-	var rows int64
-	for _, table := range tables {
-		// Delete 多表扫描也必须走 GORM 公共 API，让 GORM 自己完成 Statement 初始化。
-		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
-		copyWriteState(tx, db)
-		tx = tx.Set(skipKey, true)
-		tx = tx.Delete(db.Statement.Dest)
-		if tx.Error != nil {
-			if isMissingTableError(tx.Error) {
-				p.manager.invalidate(cfg, table)
-				continue
+	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
+		var rows int64
+		for _, table := range tables {
+			// Delete 多表扫描也必须走 GORM 公共 API，让 GORM 自己完成 Statement 初始化。
+			tx := writeDB.Session(&gorm.Session{NewDB: true}).Table(table)
+			copyWriteState(tx, writeDB)
+			tx = tx.Set(skipKey, true)
+			tx = tx.Delete(writeDB.Statement.Dest)
+			if tx.Error != nil {
+				if isMissingTableError(tx.Error) {
+					p.manager.invalidate(cfg, table)
+					continue
+				}
+				return 0, tx.Error
 			}
-			db.AddError(tx.Error)
-			return
+			rows += tx.RowsAffected
 		}
-		rows += tx.RowsAffected
+		return rows, nil
+	})
+	if err != nil {
+		db.AddError(err)
+		return
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
@@ -505,18 +532,24 @@ func (p *Plugin) execDeleteGroups(db *gorm.DB, cfg ShardingConfig, groups map[st
 		return
 	}
 
-	var rows int64
-	for table, values := range groups {
-		tx := p.deleteShardValues(db, table, values.Interface())
-		if tx.Error != nil {
-			if isMissingTableError(tx.Error) {
-				p.manager.invalidate(cfg, table)
-				continue
+	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
+		var rows int64
+		for table, values := range groups {
+			tx := p.deleteShardValues(writeDB, table, values.Interface())
+			if tx.Error != nil {
+				if isMissingTableError(tx.Error) {
+					p.manager.invalidate(cfg, table)
+					continue
+				}
+				return 0, tx.Error
 			}
-			db.AddError(tx.Error)
-			return
+			rows += tx.RowsAffected
 		}
-		rows += tx.RowsAffected
+		return rows, nil
+	})
+	if err != nil {
+		db.AddError(err)
+		return
 	}
 	db.RowsAffected = rows
 	if db.Statement.Result != nil {
@@ -672,6 +705,26 @@ func crossShardWriteLimitError(db *gorm.DB) error {
 		return fmt.Errorf("gorm_sharding: limit across shards is not supported")
 	}
 	return nil
+}
+
+// executeMultiShardWrite 在没有外层事务时为多分表 DML 创建内部事务。
+// GORM 默认会在回调外开启事务；但 SkipDefaultTransaction 为 true 时必须在此补齐，
+// 否则某个分表失败会留下前面已成功的分表写入。
+func executeMultiShardWrite(db *gorm.DB, execute func(*gorm.DB) (int64, error)) (int64, error) {
+	if hasActiveTransaction(db) {
+		return execute(db)
+	}
+
+	var rows int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		rows, err = execute(tx)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 // routeReadTables 只依据 WHERE 条件计算读取操作的真实分表，不能使用查询结果对象的字段值。

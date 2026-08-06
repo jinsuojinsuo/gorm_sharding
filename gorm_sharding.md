@@ -638,7 +638,7 @@ LIMIT 20
 
 跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、COUNT(DISTINCT)、SUM、MIN、MAX、AVG 按全部命中分表的数据计算，并保留 MySQL 的 NULL、排序规则和 HAVING 语义。
 
-限制：只支持单模型、无 Join、无子查询的 GORM 查询；跨分表时相关子查询、`EXISTS`、派生表都会返回 `gorm_sharding: subquery across shards is not supported`。Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
+限制：只支持单模型、无 Join、无子查询、无 `Preload` 的 GORM 查询；跨分表时相关子查询、`EXISTS`、派生表都会返回 `gorm_sharding: subquery across shards is not supported`，`Preload` 会返回 `gorm_sharding: preload across shards is not supported`。Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 
 
 ---
@@ -691,6 +691,8 @@ RowsAffected：
 所有表累加。
 
 批量实体更新会按每条模型实体的分表字段分组后逐表执行，避免不同分表的主键条件互相影响。
+
+多分表 Create、Update、Delete 会复用外层事务；没有外层事务时，插件创建内部事务，即使 GORM 配置了 `SkipDefaultTransaction` 也不会留下部分分表写入。
 
 跨分表 Update、Delete 不支持 `Limit`。逐表执行会把单表的全局限制放大为每张表各自限制，插件返回 `gorm_sharding: limit across shards is not supported`。
 

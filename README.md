@@ -288,9 +288,9 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw/Exec 只支持执行在一张真实分表上的 SQL：`WHERE` 中的分表字段能精确定位一张表时，会路由到该表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`，不会静默只执行其中一张表。未包含可识别分表字段时，保持当前行为并使用最新真实分表。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到最新分表。
+Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，任一分表失败会回滚已执行的分表写入。未包含可识别分表字段的 Raw 写操作会扫描最近 `MaxScanTables` 张分表。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
 
-不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。跨分表写操作请使用 GORM 的 `Updates` 或 `Delete`；跨分表读取请使用 `Find`。
+不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。Raw `UPDATE`、`DELETE` 的多分表执行由插件管理；跨分表读取请使用 `Find`。
 
 ## 自动迁移
 
@@ -353,7 +353,7 @@ go test ./... -run TestRequirement -count=1 -v
 4. 跨分表 Join 不支持。
 5. 跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
 6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
-8. Raw SQL 只支持单个真实分表的表名改写；时间条件命中多分表、复杂 Join 均不支持。
+8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
 9. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
 10. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界，插件会在初始化 DB 连接上创建表；请在事务开始前预建目标分表。
 11. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。

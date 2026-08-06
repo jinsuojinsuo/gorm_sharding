@@ -396,6 +396,12 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 
 // raw 处理 GORM Raw/Exec SQL 的表名 AST 改写并执行原始 Raw 回调。
 func (p *Plugin) raw(db *gorm.DB) {
+	if handled, err := p.executeRawWriteAcrossShards(db); handled {
+		if err != nil {
+			db.AddError(err)
+		}
+		return
+	}
 	sql, ok, err := p.rewriteRawSQL(db)
 	if err != nil {
 		db.AddError(err)

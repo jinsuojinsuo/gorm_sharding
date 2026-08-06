@@ -2,12 +2,153 @@ package gorm_sharding
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// executeRawWriteAcrossShards 逐表执行命中多张分表的 Raw UPDATE 或 DELETE。
+// 调用方已开启事务时复用当前事务；否则创建内部事务，保证任一分表失败时不会部分成功。
+func (p *Plugin) executeRawWriteAcrossShards(db *gorm.DB) (bool, error) {
+	stmt, err := sqlparser.NewTestParser().Parse(db.Statement.SQL.String())
+	if err != nil {
+		return false, nil
+	}
+	cfg, targets, ok, err := p.rawWriteTargets(stmt, db.Statement.Vars)
+	if err != nil || !ok || len(targets) <= 1 {
+		return ok && err != nil, err
+	}
+	vars := append([]interface{}(nil), db.Statement.Vars...)
+
+	execute := func(tx *gorm.DB) (int64, error) {
+		var rows int64
+		for _, table := range targets {
+			sql, err := rawWriteSQLForTable(stmt, table)
+			if err != nil {
+				return 0, err
+			}
+			// 显式传入 Context 会让 GORM 复制 Statement，避免清空内部 SQL 时
+			// 修改外层事务正在使用的 Statement 和参数。
+			shard := tx.Session(&gorm.Session{Context: tx.Statement.Context})
+			shard.Statement.SQL.Reset()
+			shard.Statement.Vars = nil
+			shard.Statement.SQL.WriteString(sql)
+			shard.Statement.Vars = append([]interface{}(nil), vars...)
+			p.rawFn(shard)
+			if shard.Error != nil {
+				if isMissingTableError(shard.Error) {
+					p.manager.invalidate(cfg, table)
+				}
+				return 0, shard.Error
+			}
+			rows += shard.RowsAffected
+		}
+		return rows, nil
+	}
+
+	var rows int64
+	if hasActiveTransaction(db) {
+		rows, err = execute(db)
+	} else {
+		err = db.Transaction(func(tx *gorm.DB) error {
+			var executeErr error
+			rows, executeErr = execute(tx)
+			return executeErr
+		})
+	}
+	if err != nil {
+		return true, err
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+	return true, nil
+}
+
+// rawWriteTargets 返回 Raw UPDATE 或 DELETE 的分表配置和所有目标真实表。
+func (p *Plugin) rawWriteTargets(stmt sqlparser.Statement, vars []interface{}) (ShardingConfig, []string, bool, error) {
+	var table sqlparser.TableName
+	var update *sqlparser.Update
+	switch statement := stmt.(type) {
+	case *sqlparser.Update:
+		if len(statement.TableExprs) != 1 {
+			return ShardingConfig{}, nil, false, nil
+		}
+		aliased, ok := statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return ShardingConfig{}, nil, false, nil
+		}
+		var tableOK bool
+		table, tableOK = aliased.Expr.(sqlparser.TableName)
+		if !tableOK {
+			return ShardingConfig{}, nil, false, nil
+		}
+		update = statement
+	case *sqlparser.Delete:
+		if len(statement.TableExprs) != 1 {
+			return ShardingConfig{}, nil, false, nil
+		}
+		aliased, ok := statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return ShardingConfig{}, nil, false, nil
+		}
+		var tableOK bool
+		table, tableOK = aliased.Expr.(sqlparser.TableName)
+		if !tableOK {
+			return ShardingConfig{}, nil, false, nil
+		}
+	default:
+		return ShardingConfig{}, nil, false, nil
+	}
+
+	cfg, ok := p.configByPrefix(table.Name.String())
+	if !ok {
+		return ShardingConfig{}, nil, false, nil
+	}
+	if update != nil && rawUpdateChangesShardingKey(update, cfg.ShardingKey) {
+		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey)
+	}
+	targets, routed := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
+	if !routed {
+		targets = p.manager.tables(cfg, time.Now())
+	}
+	if len(targets) == 0 {
+		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: no target table for %s", table.Name.String())
+	}
+	return cfg, targets, true, nil
+}
+
+// rawWriteSQLForTable 克隆 Raw 写入 AST 并把唯一逻辑表改写为指定真实分表。
+func rawWriteSQLForTable(stmt sqlparser.Statement, table string) (string, error) {
+	clone := sqlparser.CloneStatement(stmt)
+	var aliased *sqlparser.AliasedTableExpr
+	switch statement := clone.(type) {
+	case *sqlparser.Update:
+		aliased, _ = statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
+	case *sqlparser.Delete:
+		aliased, _ = statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
+	}
+	if aliased == nil {
+		return "", fmt.Errorf("gorm_sharding: raw write must target one table")
+	}
+	aliased.Expr = sqlparser.TableName{Name: sqlparser.NewIdentifierCS(table)}
+	parsed := sqlparser.NewParsedQuery(clone)
+	return restorePositionalBindVars(parsed.Query, parsed.BindLocations()), nil
+}
+
+// hasActiveTransaction 判断当前 GORM 连接池是否已处于事务中。
+func hasActiveTransaction(db *gorm.DB) bool {
+	committer, ok := db.Statement.ConnPool.(gorm.TxCommitter)
+	if !ok || committer == nil {
+		return false
+	}
+	value := reflect.ValueOf(committer)
+	return value.Kind() != reflect.Ptr || !value.IsNil()
+}
 
 // rewriteRawSQL 解析 Raw SQL 并在 AST 层改写注册过的逻辑表名。
 func (p *Plugin) rewriteRawSQL(db *gorm.DB) (string, bool, error) {

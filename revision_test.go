@@ -735,3 +735,143 @@ func TestCrossShardRowsUsesGlobalQuery(t *testing.T) {
 		t.Fatalf("rows names = %v, want [first second]", names)
 	}
 }
+
+// TestRawUpdateAcrossShards 验证 Raw UPDATE 会逐张执行命中的真实分表并累加影响行数。
+func TestRawUpdateAcrossShards(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", Score: 2, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create raw update rows: %v", err)
+	}
+
+	result := db.Exec("UPDATE gs_req_user SET score = ? WHERE created_at BETWEEN ? AND ?", 9, day1, day2)
+	if result.Error != nil {
+		t.Fatalf("raw update across shards: %v", result.Error)
+	}
+	if result.RowsAffected != 2 {
+		t.Fatalf("raw update RowsAffected = %d, want 2", result.RowsAffected)
+	}
+	var users []requirementUser
+	if err := db.Where("created_at BETWEEN ? AND ?", day1, day2).Order("name ASC").Find(&users).Error; err != nil {
+		t.Fatalf("find updated rows: %v", err)
+	}
+	if len(users) != 2 || users[0].Score != 9 || users[1].Score != 9 {
+		t.Fatalf("updated rows = %+v, want both scores 9", users)
+	}
+}
+
+// TestRawUpdateAcrossShardsRollsBackInternalTransaction 验证内部事务不会留下部分成功的数据。
+func TestRawUpdateAcrossShardsRollsBackInternalTransaction(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", Score: 2, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create rollback rows: %v", err)
+	}
+	missingTable := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day1)
+	if err := rawDB.Migrator().DropTable(missingTable); err != nil {
+		t.Fatalf("drop second raw update shard: %v", err)
+	}
+
+	result := db.Exec("UPDATE gs_req_user SET score = ? WHERE created_at BETWEEN ? AND ?", 9, day1, day2)
+	if result.Error == nil {
+		t.Fatal("raw update with missing shard returned nil error")
+	}
+	remainingTable := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day2)
+	var score int
+	if err := rawDB.Table(remainingTable).Select("score").Where("name = ?", "second").Scan(&score).Error; err != nil {
+		t.Fatalf("read row after rollback: %v", err)
+	}
+	if score != 2 {
+		t.Fatalf("score after rollback = %d, want 2", score)
+	}
+}
+
+// TestRawUpdateAcrossShardsUsesOuterTransaction 验证外层事务由调用方决定提交或回滚。
+func TestRawUpdateAcrossShardsUsesOuterTransaction(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", Score: 2, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create outer transaction rows: %v", err)
+	}
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin transaction: %v", tx.Error)
+	}
+	result := tx.Exec("UPDATE gs_req_user SET score = ? WHERE created_at BETWEEN ? AND ?", 9, day1, day2)
+	if result.Error != nil {
+		tx.Rollback()
+		t.Fatalf("raw update in outer transaction: %v", result.Error)
+	}
+	if err := tx.Rollback().Error; err != nil {
+		t.Fatalf("rollback outer transaction: %v", err)
+	}
+	for _, check := range []struct {
+		table string
+		name  string
+		want  int
+	}{
+		{ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day1), "first", 1},
+		{ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day2), "second", 2},
+	} {
+		var score int
+		if err := rawDB.Table(check.table).Select("score").Where("name = ?", check.name).Scan(&score).Error; err != nil {
+			t.Fatalf("read %s after outer rollback: %v", check.name, err)
+		}
+		if score != check.want {
+			t.Fatalf("%s score after outer rollback = %d, want %d", check.name, score, check.want)
+		}
+	}
+}
+
+// TestRawDeleteAcrossShards 验证 Raw DELETE 会逐张删除命中的真实分表记录。
+func TestRawDeleteAcrossShards(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "first", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", Score: 2, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create raw delete rows: %v", err)
+	}
+
+	result := db.Exec("DELETE FROM gs_req_user WHERE created_at BETWEEN ? AND ?", day1, day2)
+	if result.Error != nil {
+		t.Fatalf("raw delete across shards: %v", result.Error)
+	}
+	if result.RowsAffected != 2 {
+		t.Fatalf("raw delete RowsAffected = %d, want 2", result.RowsAffected)
+	}
+	var count int64
+	if err := db.Model(&requirementUser{}).Where("created_at BETWEEN ? AND ?", day1, day2).Count(&count).Error; err != nil {
+		t.Fatalf("count deleted rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rows after raw delete = %d, want 0", count)
+	}
+}

@@ -372,7 +372,7 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 		AutoCreateTable: true,
 		AutoMigrate:     true,
 	}
-	manager := newTableManager()
+	manager := newTableManager(rawDB)
 	oldHour := time.Date(2026, 8, 4, 16, 0, 0, 0, time.Local)
 	newHour := oldHour.Add(time.Hour)
 	oldTables := []string{cfg.tableName(oldHour), cfg.tableName(oldHour.Add(-time.Hour))}
@@ -402,6 +402,33 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 	}
 	if !containsString(afterCreate, oldTables[0]) {
 		t.Fatalf("new shard list after boundary create = %v, want to keep recent old shard %s", afterCreate, oldTables[0])
+	}
+}
+
+// TestRequirementCreateNewShardInsideTransaction 验证事务内首次建表不会提交业务写入。
+func TestRequirementCreateNewShardInsideTransaction(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	createdAt := time.Date(2026, 8, 6, 10, 0, 0, 0, time.Local)
+	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(createdAt)
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin transaction: %v", tx.Error)
+	}
+	if err := tx.Create(&requirementUser{Name: "rollback", CreatedAt: createdAt, UpdatedAt: createdAt}).Error; err != nil {
+		tx.Rollback()
+		t.Fatalf("create first shard row in transaction: %v", err)
+	}
+	if err := tx.Rollback().Error; err != nil {
+		t.Fatalf("rollback transaction: %v", err)
+	}
+	if !tableExists(t, rawDB, table) {
+		t.Fatalf("new shard %s was not created", table)
+	}
+	if got := countRows(t, rawDB, table, "1=1"); got != 0 {
+		t.Fatalf("rows in rolled back new shard = %d, want 0", got)
 	}
 }
 

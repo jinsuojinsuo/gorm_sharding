@@ -73,7 +73,7 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 		return err
 	}
 
-	p.manager = newTableManager()
+	p.manager = newTableManager(db)
 
 	// Replace 之前先取出原始回调；后续插件回调内部会在改完表名后调用它们。
 	p.createFn = db.Callback().Create().Get("gorm:create")

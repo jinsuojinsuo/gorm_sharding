@@ -373,7 +373,7 @@ go test ./... -run TestRequirement -count=1 -v
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
 9. Raw SQL 的子查询可访问普通非分表表，但不能引用已注册的逻辑分表。跨分表普通 GORM 查询不支持任何子查询，包括相关子查询、`EXISTS` 和派生表；单分表 GORM 查询不受此限制。
 10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
-11. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界；请在事务开始前预建目标分表。建表和元数据读取会继承当前调用的连接配置与 Context。
+11. 事务内首次写入新分表时，插件会使用初始化时保存的非事务连接创建物理表，再回到原事务执行插入。因此业务 DML 可以正常回滚，但新建的空分表会保留。元数据读取仍继承当前调用的连接配置与 Context；为避免首次写入承受 DDL 延迟，建议提前预建下一周期分表。
 12. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
 
 ## 性能说明

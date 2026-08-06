@@ -15,6 +15,10 @@ import (
 
 // tableManager 负责真实分表的存在性检查、创建、扫描和历史表迁移。
 type tableManager struct {
+	// ddlDB 保存插件初始化时的非事务连接。事务内首次建表必须使用它，
+	// 避免 MySQL DDL 在当前事务连接上隐式提交业务 DML。
+	ddlDB *gorm.DB
+
 	// seen 缓存已经确认存在的真实分表，避免循环内重复 HasTable。
 	seen sync.Map
 
@@ -26,8 +30,8 @@ type tableManager struct {
 }
 
 // newTableManager 创建表管理器实例。
-func newTableManager() *tableManager {
-	return &tableManager{}
+func newTableManager(db *gorm.DB) *tableManager {
+	return &tableManager{ddlDB: db.Session(&gorm.Session{NewDB: true})}
 }
 
 // exists 判断真实分表是否存在；已经确认存在的表会缓存，避免循环扫描时反复查 information_schema。
@@ -78,12 +82,18 @@ func (m *tableManager) ensure(db *gorm.DB, model interface{}, cfg ShardingConfig
 	if m.exists(db, table) {
 		return nil
 	}
+	createDB := db
+	if hasActiveTransaction(db) {
+		// MySQL DDL 会隐式提交当前连接的事务。改用初始化时保存的非事务连接
+		// 创建物理表，随后仍由原事务重试 INSERT，因此 Rollback 只保留空表。
+		createDB = m.ddlDB.WithContext(db.Statement.Context)
+	}
 	_, err, _ := m.createGroup.Do(table, func() (interface{}, error) {
 		if m.exists(db, table) {
 			return nil, nil
 		}
 		// 不手写 CREATE TABLE，直接让 GORM AutoMigrate 根据 struct 和 tag 创建真实分表。
-		if err := db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
+		if err := createDB.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
 			return nil, err
 		}
 		m.seen.Store(table, struct{}{})

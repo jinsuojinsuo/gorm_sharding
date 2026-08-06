@@ -68,6 +68,24 @@ func TestGroupCreateValuesSupportsArray(t *testing.T) {
 	}
 }
 
+// TestGroupCreateValuesRejectsValueArray 验证按值传入数组保持 GORM 原生 ErrInvalidValue 行为。
+func TestGroupCreateValuesRejectsValueArray(t *testing.T) {
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	values := [2]revisionDistinctUser{
+		{CreatedAt: first},
+		{CreatedAt: first.AddDate(0, 0, 1)},
+	}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Dest:         values,
+		ReflectValue: reflect.ValueOf(values),
+	}}
+
+	_, err := New().groupCreateValues(db, ShardingConfig{ShardingKey: "CreatedAt", Strategy: DayStrategy})
+	if !errors.Is(err, gorm.ErrInvalidValue) {
+		t.Fatalf("groupCreateValues value array error = %v, want %v", err, gorm.ErrInvalidValue)
+	}
+}
+
 // TestGroupUpdateValuesSupportsArray 验证数组批量 Updates 分组使用临时切片。
 func TestGroupUpdateValuesSupportsArray(t *testing.T) {
 	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)

@@ -227,6 +227,48 @@ func TestRequirementCreateInBatchesAcrossShards(t *testing.T) {
 	}
 }
 
+// TestRequirementArrayCRUDAcrossShards 验证指针数组可跨分表 Create、Updates、Delete，并回填自增主键。
+func TestRequirementArrayCRUDAcrossShards(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	users := [2]requirementUser{
+		{Name: "array_first", Score: 1, CreatedAt: first, UpdatedAt: first},
+		{Name: "array_second", Score: 2, CreatedAt: first.AddDate(0, 0, 1), UpdatedAt: first.AddDate(0, 0, 1)},
+	}
+	if result := db.Create(&users); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("array create = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+	for index, user := range users {
+		if user.ID == 0 {
+			t.Fatalf("array create user %d ID was not filled", index)
+		}
+	}
+
+	if result := db.Model(&users).Updates(map[string]interface{}{"score": 100}); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("array update = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+	for _, user := range users {
+		var score int
+		if err := rawDB.Table(ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)).
+			Where("name = ?", user.Name).Select("score").Scan(&score).Error; err != nil || score != 100 {
+			t.Fatalf("array update user %s = score:%d err:%v", user.Name, score, err)
+		}
+	}
+
+	if result := db.Delete(&users); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("array delete = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+	for _, user := range users {
+		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)
+		if got := countRows(t, rawDB, table, "name = '"+user.Name+"'"); got != 0 {
+			t.Fatalf("array delete rows in %s = %d, want 0", table, got)
+		}
+	}
+}
+
 // TestRequirementPreciseWriteWithAdditionalPredicates 验证包含分表字段和其他条件时仍然精确路由目标表。
 func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
 	prefix := requirementUser{}.TableName()

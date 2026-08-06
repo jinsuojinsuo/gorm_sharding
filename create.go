@@ -39,6 +39,11 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 		// 单条插入也统一返回分组结构，调用方可以共用建表和路由逻辑。
 		return map[string]createValueGroup{cfg.tableName(t): {values: value.Addr()}}, nil
 	}
+	if value.Kind() == reflect.Array && !value.CanAddr() {
+		// 数组按值传入时，跨分表插入后的自增主键无法回填。保持 GORM 原生 ErrInvalidValue，
+		// 而不是在 copyGeneratedValues 中对不可设置元素调用 Set 并 panic。
+		return nil, gorm.ErrInvalidValue
+	}
 	if value.Len() == 0 {
 		// GORM 原生 Create 对空切片或空数组返回 ErrEmptySlice。
 		return nil, gorm.ErrEmptySlice

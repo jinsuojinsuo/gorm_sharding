@@ -2,6 +2,7 @@ package gorm_sharding
 
 import (
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,32 @@ func TestRangeRouteMergesChainedWhere(t *testing.T) {
 	if !ok {
 		t.Fatal("chained Where range was not recognized")
 	}
+	if want := []string{"user_20260803", "user_20260802"}; !sameStrings(tables, want) {
+		t.Fatalf("tables = %v, want %v", tables, want)
+	}
+}
+
+// TestReadRouteIgnoresResultValue 验证 Find 结果对象已有分表时间时，读取仍只按 WHERE 路由。
+func TestReadRouteIgnoresResultValue(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 2)
+	result := revisionDistinctUser{CreatedAt: start.AddDate(0, 0, 30)}
+	query := db.Model(&revisionDistinctUser{}).
+		Where("created_at >= ?", start).
+		Where("created_at < ?", end)
+	// GORM 在 Find(&result) 时会把此对象放进 ReflectValue。这里显式设置它，
+	// 以验证读取路由不会再将结果对象的 CreatedAt 当作查询条件。
+	query.Statement.ReflectValue = reflect.ValueOf(&result)
+
+	tables := New().routeReadTables(query, cfg)
 	if want := []string{"user_20260803", "user_20260802"}; !sameStrings(tables, want) {
 		t.Fatalf("tables = %v, want %v", tables, want)
 	}

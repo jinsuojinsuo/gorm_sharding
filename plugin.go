@@ -275,7 +275,7 @@ func (p *Plugin) query(db *gorm.DB) {
 		p.queryFn(db)
 		return
 	}
-	tables := p.routeTables(db, cfg)
+	tables := p.routeReadTables(db, cfg)
 	if len(tables) == 0 {
 		p.executeEmptyRead(db, p.queryFn)
 		return
@@ -323,7 +323,7 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey))
 		return
 	}
-	tables := p.routeTables(db, cfg)
+	tables := p.routeWriteTables(db, cfg)
 	if len(tables) == 0 {
 		setEmptyWriteResult(db)
 		return
@@ -368,7 +368,7 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		p.deleteFn(db)
 		return
 	}
-	tables := p.routeTables(db, cfg)
+	tables := p.routeWriteTables(db, cfg)
 	if len(tables) == 0 {
 		setEmptyWriteResult(db)
 		return
@@ -447,7 +447,7 @@ func (p *Plugin) row(db *gorm.DB) {
 		p.rowFn(db)
 		return
 	}
-	tables := p.routeTables(db, cfg)
+	tables := p.routeReadTables(db, cfg)
 	if len(tables) == 0 {
 		p.executeEmptyRead(db, p.rowFn)
 		return
@@ -494,18 +494,25 @@ func setStatementTable(db *gorm.DB, table string) {
 	db.Statement.TableExpr = &clause.Expr{SQL: db.Statement.Quote(table)}
 }
 
-// routeTables 根据分表字段条件计算本次操作要访问的真实分表列表。
-func (p *Plugin) routeTables(db *gorm.DB, cfg ShardingConfig) []string {
-	// 路由优先级：精确时间条件 > 时间范围条件 > 最近 MaxScanTables 张表。
-	if t, ok := timeFromReflect(db.Statement.ReflectValue, db.Statement.Schema, cfg.ShardingKey); ok {
-		return []string{cfg.tableName(t)}
-	}
+// routeReadTables 只依据 WHERE 条件计算读取操作的真实分表，不能使用查询结果对象的字段值。
+func (p *Plugin) routeReadTables(db *gorm.DB, cfg ShardingConfig) []string {
+	// Find 的结果对象可能预先带有字段值，但 GORM 不会把这些值变成 WHERE 条件。
+	// 读取路由必须与 GORM 实际生成的筛选条件一致，避免错误地漏扫分表。
 	if where, ok := db.Statement.Clauses["WHERE"].Expression.(clause.Where); ok {
 		if tables, ok := tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey); ok {
 			return tables
 		}
 	}
 	return p.manager.tables(cfg, time.Now())
+}
+
+// routeWriteTables 根据写入模型或 WHERE 条件计算 Update、Delete 的真实分表列表。
+func (p *Plugin) routeWriteTables(db *gorm.DB, cfg ShardingConfig) []string {
+	// 按实体更新或删除时，模型字段是业务显式提供的分表定位信息，应优先使用。
+	if t, ok := timeFromReflect(db.Statement.ReflectValue, db.Statement.Schema, cfg.ShardingKey); ok {
+		return []string{cfg.tableName(t)}
+	}
+	return p.routeReadTables(db, cfg)
 }
 
 // handleMissingTable 清理被外部删除的表缓存，并把本次操作按目标表不存在处理。

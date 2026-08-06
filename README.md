@@ -8,7 +8,7 @@
 2. 支持 `time.Time` 分表字段，字段名可使用 Go 字段名或数据库列名。
 3. 插入时自动计算目标表，并在表不存在时使用 GORM `AutoMigrate` 自动创建。
 4. 批量插入会按目标分表自动拆分。
-5. 查询包含分表字段时精确路由；不包含分表字段时最多扫描最近 `MaxScanTables` 张表。
+5. 查询只根据 `WHERE` 中的分表字段精确路由；不包含可识别分表字段时最多扫描最近 `MaxScanTables` 张表。
 6. 单模型、单逻辑表的跨分表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
 7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
@@ -290,7 +290,7 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 张分表，**不保证覆盖全部历史分表**；需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
+Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。子查询可以访问普通非分表表，但不能引用已注册的逻辑分表；插件不会递归改写子查询中的逻辑表名。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 张分表，**不保证覆盖全部历史分表**；需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
 
 不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。Raw `UPDATE`、`DELETE` 的多分表执行由插件管理；跨分表读取请使用 `Find`。
 
@@ -356,9 +356,10 @@ go test ./... -run TestRequirement -count=1 -v
 5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
 6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
-9. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
-10. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界，插件会在初始化 DB 连接上创建表；请在事务开始前预建目标分表。
-11. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
+9. 子查询可访问普通非分表表，但不能引用已注册的逻辑分表；Raw SQL 与 GORM 查询都不会递归改写子查询中的逻辑表名。
+10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
+11. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界，插件会在初始化 DB 连接上创建表；请在事务开始前预建目标分表。
+12. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
 
 ## 性能说明
 

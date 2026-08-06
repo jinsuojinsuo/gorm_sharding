@@ -37,7 +37,7 @@ func (p *Plugin) groupDeleteValues(db *gorm.DB, cfg ShardingConfig) (groups map[
 		table := cfg.tableName(at)
 		group, ok := groups[table]
 		if !ok {
-			group = reflect.MakeSlice(value.Type(), 0, 1)
+			group = reflect.MakeSlice(groupSliceType(value), 0, 1)
 		}
 		groups[table] = reflect.Append(group, elem)
 	}

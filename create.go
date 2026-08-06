@@ -39,6 +39,10 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 		// 单条插入也统一返回分组结构，调用方可以共用建表和路由逻辑。
 		return map[string]createValueGroup{cfg.tableName(t): {values: value.Addr()}}, nil
 	}
+	if value.Len() == 0 {
+		// GORM 原生 Create 对空切片或空数组返回 ErrEmptySlice。
+		return nil, gorm.ErrEmptySlice
+	}
 
 	groups := make(map[string]createValueGroup)
 	for i := 0; i < value.Len(); i++ {
@@ -50,7 +54,7 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 		table := cfg.tableName(t)
 		group, ok := groups[table]
 		if !ok {
-			group.values = reflect.MakeSlice(value.Type(), 0, 1)
+			group.values = reflect.MakeSlice(groupSliceType(value), 0, 1)
 			group.original = value
 		}
 		// 同一批数据按目标分表聚合，后续每个分表执行一次批量插入。
@@ -64,13 +68,22 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 // copyGeneratedValues 把 GORM 在分表插入中回填的字段同步给调用方的 []T。
 // []*T 的元素本身就是原对象指针，GORM 已直接完成回填，无需再次复制。
 func (group createValueGroup) copyGeneratedValues() {
-	if group.original.Kind() != reflect.Slice || group.original.Type().Elem().Kind() == reflect.Ptr {
+	if (group.original.Kind() != reflect.Slice && group.original.Kind() != reflect.Array) || group.original.Type().Elem().Kind() == reflect.Ptr {
 		return
 	}
 
 	for groupIndex, sourceIndex := range group.sourceIndexes {
 		group.original.Index(sourceIndex).Set(group.values.Index(groupIndex))
 	}
+}
+
+// groupSliceType 返回用于分组的切片类型。GORM 支持数组批量操作，但 reflect.MakeSlice
+// 只能创建切片，因此数组分组需要转换为同元素类型的临时切片。
+func groupSliceType(value reflect.Value) reflect.Type {
+	if value.Kind() == reflect.Array {
+		return reflect.SliceOf(value.Type().Elem())
+	}
+	return value.Type()
 }
 
 // valueTime 从结构体中读取分表字段的 time.Time 值。

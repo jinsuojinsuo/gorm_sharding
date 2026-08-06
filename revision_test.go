@@ -28,6 +28,92 @@ func TestGroupCreateValuesKeepsGormInvalidValue(t *testing.T) {
 	}
 }
 
+// TestGroupCreateValuesKeepsGormEmptySlice 验证空切片 Create 保持 GORM 原生 ErrEmptySlice 行为。
+func TestGroupCreateValuesKeepsGormEmptySlice(t *testing.T) {
+	values := []revisionDistinctUser{}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Dest:         &values,
+		ReflectValue: reflect.ValueOf(&values).Elem(),
+	}}
+
+	_, err := New().groupCreateValues(db, ShardingConfig{ShardingKey: "CreatedAt", Strategy: DayStrategy})
+	if !errors.Is(err, gorm.ErrEmptySlice) {
+		t.Fatalf("groupCreateValues error = %v, want %v", err, gorm.ErrEmptySlice)
+	}
+}
+
+// TestGroupCreateValuesSupportsArray 验证数组 Create 分组使用临时切片，不会调用 reflect.MakeSlice 创建数组。
+func TestGroupCreateValuesSupportsArray(t *testing.T) {
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	values := [2]revisionDistinctUser{
+		{CreatedAt: first},
+		{CreatedAt: first.AddDate(0, 0, 1)},
+	}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Dest:         &values,
+		ReflectValue: reflect.ValueOf(&values).Elem(),
+	}}
+
+	groups, err := New().groupCreateValues(db, ShardingConfig{ShardingKey: "CreatedAt", Strategy: DayStrategy})
+	if err != nil {
+		t.Fatalf("groupCreateValues array: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("array create group count = %d, want 2", len(groups))
+	}
+	for table, group := range groups {
+		if group.values.Kind() != reflect.Slice || group.values.Len() != 1 {
+			t.Fatalf("array create group %s = %v, want one-element slice", table, group.values)
+		}
+	}
+}
+
+// TestGroupUpdateValuesSupportsArray 验证数组批量 Updates 分组使用临时切片。
+func TestGroupUpdateValuesSupportsArray(t *testing.T) {
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	values := [2]revisionDistinctUser{
+		{CreatedAt: first},
+		{CreatedAt: first.AddDate(0, 0, 1)},
+	}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Model:        &values,
+		ReflectValue: reflect.ValueOf(&values).Elem(),
+	}}
+
+	groups, grouped, err := New().groupUpdateValues(db, ShardingConfig{ShardingKey: "CreatedAt", Strategy: DayStrategy})
+	if err != nil || !grouped || len(groups) != 2 {
+		t.Fatalf("groupUpdateValues array = groups:%v grouped:%v err:%v", groups, grouped, err)
+	}
+	for table, group := range groups {
+		if group.Kind() != reflect.Slice || group.Len() != 1 {
+			t.Fatalf("array update group %s = %v, want one-element slice", table, group)
+		}
+	}
+}
+
+// TestGroupDeleteValuesSupportsArray 验证数组批量 Delete 分组使用临时切片。
+func TestGroupDeleteValuesSupportsArray(t *testing.T) {
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	values := [2]revisionDistinctUser{
+		{CreatedAt: first},
+		{CreatedAt: first.AddDate(0, 0, 1)},
+	}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Dest:         &values,
+		ReflectValue: reflect.ValueOf(&values).Elem(),
+	}}
+
+	groups, grouped, err := New().groupDeleteValues(db, ShardingConfig{ShardingKey: "CreatedAt", Strategy: DayStrategy})
+	if err != nil || !grouped || len(groups) != 2 {
+		t.Fatalf("groupDeleteValues array = groups:%v grouped:%v err:%v", groups, grouped, err)
+	}
+	for table, group := range groups {
+		if group.Kind() != reflect.Slice || group.Len() != 1 {
+			t.Fatalf("array delete group %s = %v, want one-element slice", table, group)
+		}
+	}
+}
+
 // revisionDistinctUser 是跨分表 DISTINCT 验收测试使用的模型。
 type revisionDistinctUser struct {
 	ID        uint64    `gorm:"column:id;primaryKey;autoIncrement"`

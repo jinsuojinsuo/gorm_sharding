@@ -288,7 +288,7 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，任一分表失败会回滚已执行的分表写入。未包含可识别分表字段的 Raw 写操作会扫描最近 `MaxScanTables` 张分表。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
+Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，任一分表失败会回滚已执行的分表写入。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。未包含可识别分表字段的 Raw 写操作会扫描最近 `MaxScanTables` 张分表。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
 
 不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。Raw `UPDATE`、`DELETE` 的多分表执行由插件管理；跨分表读取请使用 `Find`。
 

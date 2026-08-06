@@ -775,6 +775,8 @@ Raw `SELECT` 只支持目标明确的一张真实分表；条件命中多张分�
 
 Raw `UPDATE`、`DELETE` 支持命中多张真实分表：插件从同一份 SQL AST 克隆出每张真实分表的 SQL，逐表执行并累加 `RowsAffected`，不通过 `multiStatements=true` 拼接多条 SQL。
 
+Raw 写操作只支持单模型、单逻辑表。`UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。
+
 事务规则：调用方已开启事务时复用外层事务，插件不提交也不回滚外层事务；调用方未开启事务时，插件为多分表 Raw 写操作创建内部事务，任一分表失败则整体回滚。
 
 Raw `INSERT` 到逻辑分表名不支持，因为当前 Raw 路径不解析 `VALUES` 中的分表字段；应使用 `Create`。

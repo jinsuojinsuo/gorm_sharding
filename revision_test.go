@@ -189,6 +189,26 @@ func TestRawStatementDetectsMultipleShards(t *testing.T) {
 	}
 }
 
+// TestRawJoinWriteIsRejected 验证包含逻辑分表的 Raw JOIN 写入不会回退执行原始 SQL。
+func TestRawJoinWriteIsRejected(t *testing.T) {
+	plugin := New()
+	plugin.configs[modelKey(requirementUser{})] = ShardingConfig{
+		tablePrefix: "gs_req_user",
+		ShardingKey: "created_at",
+		Strategy:    DayStrategy,
+	}
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"UPDATE gs_req_user JOIN orders ON orders.user_id = gs_req_user.id SET gs_req_user.score = 9 WHERE gs_req_user.created_at = ?",
+	)
+	if err != nil {
+		t.Fatalf("parse raw join update: %v", err)
+	}
+	_, _, handled, err := plugin.rawWriteTargets(stmt, []interface{}{time.Now()})
+	if !handled || err == nil {
+		t.Fatalf("raw join write handled = %v, err = %v; want handled error", handled, err)
+	}
+}
+
 // TestRouteParsesSliceArgumentIn 防止 created_at IN ? 的时间切片退化为最近表扫描。
 func TestRouteParsesSliceArgumentIn(t *testing.T) {
 	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}

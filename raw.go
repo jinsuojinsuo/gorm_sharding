@@ -76,30 +76,30 @@ func (p *Plugin) rawWriteTargets(stmt sqlparser.Statement, vars []interface{}) (
 	switch statement := stmt.(type) {
 	case *sqlparser.Update:
 		if len(statement.TableExprs) != 1 {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 		aliased, ok := statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
 		if !ok {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 		var tableOK bool
 		table, tableOK = aliased.Expr.(sqlparser.TableName)
 		if !tableOK {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 		update = statement
 	case *sqlparser.Delete:
 		if len(statement.TableExprs) != 1 {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 		aliased, ok := statement.TableExprs[0].(*sqlparser.AliasedTableExpr)
 		if !ok {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 		var tableOK bool
 		table, tableOK = aliased.Expr.(sqlparser.TableName)
 		if !tableOK {
-			return ShardingConfig{}, nil, false, nil
+			return p.rejectComplexRawWrite(stmt)
 		}
 	default:
 		return ShardingConfig{}, nil, false, nil
@@ -120,6 +120,32 @@ func (p *Plugin) rawWriteTargets(stmt sqlparser.Statement, vars []interface{}) (
 		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: no target table for %s", table.Name.String())
 	}
 	return cfg, targets, true, nil
+}
+
+// rejectComplexRawWrite 拒绝引用逻辑分表的 JOIN、多表或派生表 Raw 写入。
+// 这类 SQL 不能安全地拆成逐分表语句，绝不能回退执行未改写的逻辑表名。
+func (p *Plugin) rejectComplexRawWrite(stmt sqlparser.Statement) (ShardingConfig, []string, bool, error) {
+	if p.rawStatementReferencesShardedTable(stmt) {
+		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: raw multi-table write is not supported")
+	}
+	return ShardingConfig{}, nil, false, nil
+}
+
+// rawStatementReferencesShardedTable 判断 AST 任意位置是否引用已注册的逻辑分表。
+func (p *Plugin) rawStatementReferencesShardedTable(stmt sqlparser.Statement) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		table, ok := node.(sqlparser.TableName)
+		if !ok {
+			return true, nil
+		}
+		if _, ok := p.configByPrefix(table.Name.String()); ok {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, stmt)
+	return found
 }
 
 // rawWriteSQLForTable 克隆 Raw 写入 AST 并把唯一逻辑表改写为指定真实分表。

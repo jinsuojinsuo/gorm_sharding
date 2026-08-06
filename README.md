@@ -279,6 +279,12 @@ res := db.Model(&User{}).
 
 ```go
 res := db.Where("created_at = ? AND name = ?", createdAt, "alice").Delete(&User{})
+
+// 批量实体删除会按每个实体的 CreatedAt 自动分组到对应分表。
+res = db.Delete(&[]User{
+	{ID: 1, CreatedAt: firstCreatedAt},
+	{ID: 2, CreatedAt: secondCreatedAt},
+})
 ```
 
 ### Raw SQL

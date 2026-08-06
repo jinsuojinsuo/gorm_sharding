@@ -288,6 +288,40 @@ func TestCrossShardWriteLimitIsRejected(t *testing.T) {
 	}
 }
 
+// TestGroupDeleteValuesByShard 验证批量 Delete 会按每个实体的分表时间分组。
+func TestGroupDeleteValuesByShard(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	if err := db.Statement.Parse(&revisionDistinctUser{}); err != nil {
+		t.Fatalf("parse delete model: %v", err)
+	}
+	first := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	second := first.AddDate(0, 0, 1)
+	db.Statement.ReflectValue = reflect.ValueOf([]revisionDistinctUser{
+		{ID: 1, CreatedAt: first},
+		{ID: 2, CreatedAt: second},
+	})
+	cfg := ShardingConfig{tablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
+
+	groups, grouped, err := New().groupDeleteValues(db, cfg)
+	if err != nil || !grouped {
+		t.Fatalf("groups = %v, grouped = %v, err = %v", groups, grouped, err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("group count = %d, want 2", len(groups))
+	}
+	if group := groups["user_20260802"]; group.Len() != 1 || group.Index(0).FieldByName("ID").Uint() != 1 {
+		t.Fatalf("first shard group = %v", group)
+	}
+	if group := groups["user_20260803"]; group.Len() != 1 || group.Index(0).FieldByName("ID").Uint() != 2 {
+		t.Fatalf("second shard group = %v", group)
+	}
+}
+
 // TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
 func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 	prefix := requirementUser{}.TableName()

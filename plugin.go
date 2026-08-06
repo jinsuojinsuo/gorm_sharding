@@ -376,6 +376,15 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		p.deleteFn(db)
 		return
 	}
+	groups, grouped, err := p.groupDeleteValues(db, cfg)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
+	if grouped {
+		p.execDeleteGroups(db, cfg, groups)
+		return
+	}
 	tables := p.routeWriteTables(db, cfg)
 	if len(tables) == 0 {
 		setEmptyWriteResult(db)
@@ -402,6 +411,42 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		copyWriteState(tx, db)
 		tx = tx.Set(skipKey, true)
 		tx = tx.Delete(db.Statement.Dest)
+		if tx.Error != nil {
+			if isMissingTableError(tx.Error) {
+				p.manager.invalidate(cfg, table)
+				continue
+			}
+			db.AddError(tx.Error)
+			return
+		}
+		rows += tx.RowsAffected
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// execDeleteGroups 按真实分表执行批量实体删除，避免跨分表切片按首元素错误路由。
+func (p *Plugin) execDeleteGroups(db *gorm.DB, cfg ShardingConfig, groups map[string]reflect.Value) {
+	if len(groups) == 1 {
+		for table := range groups {
+			setStatementTable(db, table)
+			p.deleteFn(db)
+			if p.handleMissingTable(db, cfg, table) {
+				return
+			}
+			return
+		}
+	}
+	if err := crossShardWriteLimitError(db); err != nil {
+		db.AddError(err)
+		return
+	}
+
+	var rows int64
+	for table, values := range groups {
+		tx := p.deleteShardValues(db, table, values.Interface())
 		if tx.Error != nil {
 			if isMissingTableError(tx.Error) {
 				p.manager.invalidate(cfg, table)

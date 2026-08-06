@@ -538,7 +538,8 @@ func columnCandidates(key string) []string {
 func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
 	start, end := bounds.start, bounds.end
 	if end.Before(start) {
-		start, end = end, start
+		// 原始 WHERE 条件必定为空集，不能交换边界后扫描无关的历史分表。
+		return nil
 	}
 	if bounds.endExclusive && cfg.tableName(end) != cfg.tableName(end.Add(-time.Nanosecond)) {
 		// 上界恰好位于下一个分片起点时，该分片不属于 [start, end)。

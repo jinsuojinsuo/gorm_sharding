@@ -276,6 +276,10 @@ func (p *Plugin) query(db *gorm.DB) {
 		return
 	}
 	tables := p.routeTables(db, cfg)
+	if len(tables) == 0 {
+		p.executeEmptyRead(db, p.queryFn)
+		return
+	}
 	if len(tables) <= 1 {
 		if len(tables) == 1 {
 			// 精确命中一张表时保持普通 GORM 查询路径，返回值和单表体验一致。
@@ -320,6 +324,10 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		return
 	}
 	tables := p.routeTables(db, cfg)
+	if len(tables) == 0 {
+		setEmptyWriteResult(db)
+		return
+	}
 	if len(tables) <= 1 {
 		if len(tables) == 1 {
 			setStatementTable(db, tables[0])
@@ -361,6 +369,10 @@ func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
 		return
 	}
 	tables := p.routeTables(db, cfg)
+	if len(tables) == 0 {
+		setEmptyWriteResult(db)
+		return
+	}
 	if len(tables) <= 1 {
 		if len(tables) == 1 {
 			setStatementTable(db, tables[0])
@@ -436,6 +448,10 @@ func (p *Plugin) row(db *gorm.DB) {
 		return
 	}
 	tables := p.routeTables(db, cfg)
+	if len(tables) == 0 {
+		p.executeEmptyRead(db, p.rowFn)
+		return
+	}
 	if len(tables) <= 1 {
 		if len(tables) == 1 {
 			setStatementTable(db, tables[0])
@@ -452,6 +468,22 @@ func (p *Plugin) row(db *gorm.DB) {
 	if err := p.executeCombinedRow(db, cfg, tables); err != nil {
 		db.AddError(err)
 		return
+	}
+}
+
+// executeEmptyRead 使用恒为空的结果集完成 Query 或 Row 回调，保持 Find、Scan、Rows 的空结果语义。
+func (p *Plugin) executeEmptyRead(db *gorm.DB, execute func(*gorm.DB)) {
+	db.Statement.SQL.Reset()
+	db.Statement.SQL.WriteString("SELECT 1 AS gorm_sharding_empty FROM DUAL WHERE 1 = 0")
+	db.Statement.Vars = nil
+	execute(db)
+}
+
+// setEmptyWriteResult 在矛盾时间范围下跳过 Update/Delete，并返回零影响行数。
+func setEmptyWriteResult(db *gorm.DB) {
+	db.RowsAffected = 0
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = 0
 	}
 }
 

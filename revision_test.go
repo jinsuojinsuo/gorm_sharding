@@ -158,6 +158,62 @@ func TestRangeRouteMergesChainedWhere(t *testing.T) {
 	}
 }
 
+// TestReverseRangeRoutesNoTables 验证上界早于下界的矛盾范围不扫描任何分表。
+func TestReverseRangeRoutesNoTables(t *testing.T) {
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	start := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, -2)
+	tables, ok := tablesFromExprs([]clause.Expression{
+		clause.Expr{SQL: "created_at >= ? AND created_at < ?", Vars: []interface{}{start, end}},
+	}, cfg, "created_at")
+	if !ok {
+		t.Fatal("reverse range was not recognized")
+	}
+	if len(tables) != 0 {
+		t.Fatalf("tables = %v, want no tables", tables)
+	}
+}
+
+// TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
+func TestReverseRangeReturnsEmptyResult(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	if err := db.Create(&requirementUser{Name: "kept", Score: 1, CreatedAt: day, UpdatedAt: day}).Error; err != nil {
+		t.Fatalf("create reverse range row: %v", err)
+	}
+	start := day.AddDate(0, 0, 1)
+	end := day
+
+	var users []requirementUser
+	if err := db.Where("created_at >= ? AND created_at < ?", start, end).Find(&users).Error; err != nil {
+		t.Fatalf("reverse range find: %v", err)
+	}
+	if len(users) != 0 {
+		t.Fatalf("reverse range find rows = %+v, want empty", users)
+	}
+
+	var scanned []requirementUser
+	if err := db.Model(&requirementUser{}).Where("created_at >= ? AND created_at < ?", start, end).Scan(&scanned).Error; err != nil {
+		t.Fatalf("reverse range scan: %v", err)
+	}
+	if len(scanned) != 0 {
+		t.Fatalf("reverse range scan rows = %+v, want empty", scanned)
+	}
+
+	result := db.Model(&requirementUser{}).
+		Where("created_at >= ? AND created_at < ?", start, end).
+		Updates(map[string]interface{}{"score": 9})
+	if result.Error != nil {
+		t.Fatalf("reverse range update: %v", result.Error)
+	}
+	if result.RowsAffected != 0 {
+		t.Fatalf("reverse range update RowsAffected = %d, want 0", result.RowsAffected)
+	}
+}
+
 // TestRawStatementRoutesHistoricalExactTime 防止 Raw 查询忽略时间条件而固定路由到最新分表。
 func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
 	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}

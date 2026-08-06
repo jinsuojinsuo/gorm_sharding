@@ -585,9 +585,9 @@ Go合并：
 
 ## 一致性原则
 
-跨分表查询的首要目标是与同一份数据存放在单表时的 MySQL/GORM 结果一致。代码量和单次查询性能不能改变 SQL 语义。
+单模型、单逻辑表且不包含 Join 的跨分表查询，首要目标是与同一份数据存放在单表时的 MySQL/GORM 结果一致。跨分表 Join 不在第一版支持范围内。代码量和单次查询性能不能改变 SQL 语义。
 
-因此，所有跨分表读取统一使用 MySQL 外层查询完成最终计算，包括 `Find`、`Scan`、`Rows`、`Order`、`Offset`、`Limit`、`Distinct`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By` 与 `Having`。只有经过等价性测试验证且不改变结果集语义的操作才允许逐表优化。
+因此，符合上述范围的跨分表读取统一使用 MySQL 外层查询完成最终计算，包括 `Find`、`Scan`、`Rows`、`Order`、`Offset`、`Limit`、`Distinct`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By` 与 `Having`。只有经过等价性测试验证且不改变结果集语义的操作才允许逐表优化。
 
 
 如果：

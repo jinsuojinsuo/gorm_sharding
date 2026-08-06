@@ -9,7 +9,7 @@
 3. 插入时自动计算目标表，并在表不存在时使用 GORM `AutoMigrate` 自动创建。
 4. 批量插入会按目标分表自动拆分。
 5. 查询包含分表字段时精确路由；不包含分表字段时最多扫描最近 `MaxScanTables` 张表。
-6. 跨表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
+6. 单模型、单逻辑表的跨分表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
 7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
 9. 支持显式调用 `plugin.AutoMigrate(db, model)` 同步历史分表字段。
@@ -178,7 +178,7 @@ err := db.Where("name = ?", "alice").Find(&users).Error
 
 跨分表 `Count`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By`、`Having` 会由 MySQL 执行全局查询：插件使用 `UNION ALL` 合并各真实分表的原始行，再在外层保留原始 SQL 的 `SELECT`、聚合、分组、排序和分页。
 
-这样 `Find` 和 `Scan` 的结果可保持与单表 MySQL 查询一致，包括 `NULL` 语义、`COUNT(DISTINCT ...)`、加权 `AVG`、数据库排序规则和 `HAVING`。
+对于单模型、单逻辑表且不包含 Join 的查询，`Find` 和 `Scan` 的结果可保持与单表 MySQL 查询一致，包括 `NULL` 语义、`COUNT(DISTINCT ...)`、加权 `AVG`、数据库排序规则和 `HAVING`。
 
 ```go
 var total int64
@@ -351,7 +351,7 @@ go test ./... -run TestRequirement -count=1 -v
 2. 分表字段只支持 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`。
 3. 不支持 int 时间戳、字符串日期、SQL 表达式计算分表字段。
 4. 跨分表 Join 不支持。
-5. 跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
+5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
 6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
 9. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。

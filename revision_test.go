@@ -2,6 +2,7 @@ package gorm_sharding
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +113,51 @@ func TestRangeRouteUsesIntersectionBounds(t *testing.T) {
 	}
 }
 
+// TestRangeRouteMergesSeparateWhereExpressions 验证多次 Where 产生的独立表达式会合并为同一范围。
+func TestRangeRouteMergesSeparateWhereExpressions(t *testing.T) {
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 2)
+
+	tables, ok := tablesFromExprs([]clause.Expression{
+		clause.Expr{SQL: "created_at >= ?", Vars: []interface{}{start}},
+		clause.Expr{SQL: "created_at < ?", Vars: []interface{}{end}},
+	}, cfg, "created_at")
+	if !ok {
+		t.Fatal("separate range expressions were not recognized")
+	}
+	if want := []string{"user_20260803", "user_20260802"}; !sameStrings(tables, want) {
+		t.Fatalf("tables = %v, want %v", tables, want)
+	}
+}
+
+// TestRangeRouteMergesChainedWhere 验证 GORM 连续 Where 产生的 Statement 也能精确路由。
+func TestRangeRouteMergesChainedWhere(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 2)
+	query := db.Model(&requirementUser{}).
+		Where("created_at >= ?", start).
+		Where("created_at < ?", end)
+	where, ok := query.Statement.Clauses["WHERE"].Expression.(clause.Where)
+	if !ok {
+		t.Fatal("GORM did not create WHERE clause")
+	}
+	tables, ok := tablesFromExprs(where.Exprs, cfg, "created_at")
+	if !ok {
+		t.Fatal("chained Where range was not recognized")
+	}
+	if want := []string{"user_20260803", "user_20260802"}; !sameStrings(tables, want) {
+		t.Fatalf("tables = %v, want %v", tables, want)
+	}
+}
+
 // TestRawStatementRoutesHistoricalExactTime 防止 Raw 查询忽略时间条件而固定路由到最新分表。
 func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
 	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
@@ -171,6 +217,51 @@ func TestAggregateQueryDetection(t *testing.T) {
 	}
 	if !isAggregateQuery(db.Model(&requirementUser{}).Select("SUM(score), MIN(score), MAX(score), AVG(score)")) {
 		t.Fatal("common aggregate select was not detected")
+	}
+}
+
+// TestCombinedDistinctLimitStaysInOuterQuery 验证 DISTINCT 分页不会在去重前截断分表原始行。
+func TestCombinedDistinctLimitStaysInOuterQuery(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	plugin := New()
+	query := db.Model(&revisionDistinctUser{}).
+		Distinct("name").
+		Order("name ASC").
+		Limit(2)
+
+	sql, _, err := plugin.buildCombinedQuery(query, []string{"gs_req_revision_distinct_user_20260802", "gs_req_revision_distinct_user_20260803"})
+	if err != nil {
+		t.Fatalf("build combined distinct query: %v", err)
+	}
+	if count := strings.Count(strings.ToLower(sql), "limit"); count != 1 {
+		t.Fatalf("distinct query has %d LIMIT clauses, want only outer LIMIT: %s", count, sql)
+	}
+}
+
+// TestCombinedAggregateLimitStaysInOuterQuery 验证聚合在完整分表原始行集上计算。
+func TestCombinedAggregateLimitStaysInOuterQuery(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	plugin := New()
+	query := db.Model(&requirementUser{}).
+		Select("COUNT(*) AS total, SUM(score) AS score_sum, AVG(score) AS score_avg").
+		Limit(1)
+
+	sql, _, err := plugin.buildCombinedQuery(query, []string{"gs_req_user_20260802", "gs_req_user_20260803"})
+	if err != nil {
+		t.Fatalf("build combined aggregate query: %v", err)
+	}
+	if count := strings.Count(strings.ToLower(sql), "limit"); count != 1 {
+		t.Fatalf("aggregate query has %d LIMIT clauses, want only outer LIMIT: %s", count, sql)
 	}
 }
 

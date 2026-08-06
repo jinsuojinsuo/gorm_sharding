@@ -243,6 +243,10 @@ db.Where("created_at BETWEEN ? AND ?", start, end)
 db.Where("created_at >= ? AND created_at < ?", start, end)
 db.Where("created_at > ? AND created_at <= ?", start, end)
 
+// 连续 Where 范围：插件会收集上下界并按交集精确路由
+db.Where("created_at >= ?", start).
+	Where("created_at < ?", end)
+
 // IN 条件
 db.Where("created_at IN (?, ?)", t1, t2)
 db.Where("created_at IN ?", []time.Time{t1, t2})
@@ -255,6 +259,8 @@ db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
 ```
 
 如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 张真实分表。
+
+多个范围条件会按 `AND` 交集计算：下界取较晚时间，上界取较早时间；不会因范围分别写在多次 `Where` 调用中而退化为最近表扫描。
 
 ### 更新
 

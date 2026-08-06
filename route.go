@@ -169,40 +169,87 @@ type timeRangeBounds struct {
 
 // timeRangeBoundsFromExprs 提取时间范围及上界是否排除，供分表边界计算使用。
 func timeRangeBoundsFromExprs(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
+	bounds, found := collectRangeBounds(exprs, key)
+	if !found || bounds.start.IsZero() || bounds.end.IsZero() {
+		return timeRangeBounds{}, false
+	}
+	return bounds, true
+}
+
+// collectRangeBounds 收集表达式列表中的范围片段，并按 AND 语义取交集。
+// 返回值允许只包含上界或下界，供调用方继续与其他 Where 表达式合并。
+func collectRangeBounds(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
 	var bounds timeRangeBounds
+	found := false
 	for _, expr := range exprs {
-		switch e := expr.(type) {
-		case clause.Expr:
-			if parsed, ok := timeRangeBoundsFromSQLExpr(e.SQL, e.Vars, key); ok {
-				return parsed, true
-			}
+		parsed, ok := rangeBoundsFromExpression(expr, key)
+		if !ok {
+			continue
+		}
+		if !found {
+			bounds = parsed
+			found = true
+			continue
+		}
+		bounds = intersectRangeBounds(bounds, parsed)
+	}
+	return bounds, found
+}
+
+// rangeBoundsFromExpression 读取单个 GORM 条件中的完整或部分范围边界。
+func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBounds, bool) {
+	switch e := expr.(type) {
+	case clause.Expr:
+		return timeRangeBoundsFromSQLExpr(e.SQL, e.Vars, key)
+	case clause.Gt, clause.Gte:
+		var column interface{}
+		var value interface{}
+		switch condition := e.(type) {
 		case clause.Gt:
-			if columnMatches(e.Column, key) {
-				bounds.start, _ = asTime(e.Value)
-			}
+			column, value = condition.Column, condition.Value
 		case clause.Gte:
-			if columnMatches(e.Column, key) {
-				bounds.start, _ = asTime(e.Value)
-			}
-		case clause.Lt:
-			if columnMatches(e.Column, key) {
-				bounds.end, _ = asTime(e.Value)
-				bounds.endExclusive = true
-			}
-		case clause.Lte:
-			if columnMatches(e.Column, key) {
-				bounds.end, _ = asTime(e.Value)
-			}
-		case clause.AndConditions:
-			if parsed, ok := timeRangeBoundsFromExprs(e.Exprs, key); ok {
-				return parsed, true
+			column, value = condition.Column, condition.Value
+		}
+		if columnMatches(column, key) {
+			if start, ok := asTime(value); ok {
+				return timeRangeBounds{start: start}, true
 			}
 		}
-	}
-	if !bounds.start.IsZero() && !bounds.end.IsZero() {
-		return bounds, true
+	case clause.Lt, clause.Lte:
+		var column interface{}
+		var value interface{}
+		exclusive := false
+		switch condition := e.(type) {
+		case clause.Lt:
+			column, value, exclusive = condition.Column, condition.Value, true
+		case clause.Lte:
+			column, value = condition.Column, condition.Value
+		}
+		if columnMatches(column, key) {
+			if end, ok := asTime(value); ok {
+				return timeRangeBounds{end: end, endExclusive: exclusive}, true
+			}
+		}
+	case clause.AndConditions:
+		return collectRangeBounds(e.Exprs, key)
 	}
 	return timeRangeBounds{}, false
+}
+
+// intersectRangeBounds 合并两个 AND 范围条件：下界取较晚值，上界取较早值。
+func intersectRangeBounds(left, right timeRangeBounds) timeRangeBounds {
+	if !right.start.IsZero() && (left.start.IsZero() || right.start.After(left.start)) {
+		left.start = right.start
+	}
+	if !right.end.IsZero() {
+		if left.end.IsZero() || right.end.Before(left.end) {
+			left.end = right.end
+			left.endExclusive = right.endExclusive
+		} else if right.end.Equal(left.end) {
+			left.endExclusive = left.endExclusive || right.endExclusive
+		}
+	}
+	return left
 }
 
 // timeRangeFromSQLExpr 从字符串 where 条件中提取 BETWEEN 或上下界时间条件。

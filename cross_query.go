@@ -96,8 +96,9 @@ func (p *Plugin) buildCombinedQuery(db *gorm.DB, tables []string) (string, []int
 	innerTemplate.Distinct = false
 
 	if limit, offset, ok := statementLimit(db); ok {
-		// 明细查询每个分表最多取 offset + limit 行，外层再应用原分页。
-		if outer.GroupBy == nil || len(outer.GroupBy.Exprs) == 0 {
+		// 只有普通明细查询才能把分页下推到每张分表。DISTINCT、聚合、分组和
+		// HAVING 都必须先基于完整原始行集在外层计算，否则会改变单表 SQL 语义。
+		if canPushDownDetailLimit(db, outer) {
 			innerTemplate.OrderBy = sqlparser.CloneOrderBy(original.OrderBy)
 			innerTemplate.Limit = sqlLimit(limit + offset)
 		}
@@ -128,6 +129,19 @@ func (p *Plugin) buildCombinedQuery(db *gorm.DB, tables []string) (string, []int
 		return "", nil, err
 	}
 	return restorePositionalBindVars(parsed.Query, parsed.BindLocations()), vars, nil
+}
+
+// canPushDownDetailLimit 判断当前查询是否可以安全地把分页下推到每张真实分表。
+// 对普通明细的全局 Top N，下推 offset + limit 不会遗漏结果；其他查询必须由外层 MySQL
+// 在完整行集上执行 DISTINCT、聚合、GROUP BY 或 HAVING，才能保持与单表查询一致。
+func canPushDownDetailLimit(db *gorm.DB, selectStmt *sqlparser.Select) bool {
+	if db.Statement.Distinct || selectStmt.Distinct || isAggregateQuery(db) {
+		return false
+	}
+	if selectStmt.GroupBy != nil && len(selectStmt.GroupBy.Exprs) > 0 {
+		return false
+	}
+	return selectStmt.Having == nil
 }
 
 // statementLimit 读取 GORM 当前查询的分页参数。

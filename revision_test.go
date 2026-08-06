@@ -217,6 +217,22 @@ func TestEqualHalfOpenRangeRoutesNoTables(t *testing.T) {
 	}
 }
 
+// TestEqualOpenStartRangeRoutesNoTables 验证 (t, t] 的排他下界范围不会扫描任何分表。
+func TestEqualOpenStartRangeRoutesNoTables(t *testing.T) {
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	at := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+
+	tables, ok := tablesFromExprs([]clause.Expression{
+		clause.Expr{SQL: "created_at > ? AND created_at <= ?", Vars: []interface{}{at, at}},
+	}, cfg, "created_at")
+	if !ok {
+		t.Fatal("equal open-start range was not recognized")
+	}
+	if len(tables) != 0 {
+		t.Fatalf("tables = %v, want no tables", tables)
+	}
+}
+
 // TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
 func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 	prefix := requirementUser{}.TableName()

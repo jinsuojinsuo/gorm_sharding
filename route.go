@@ -162,12 +162,13 @@ func timeRangeFromExprs(exprs []clause.Expression, key string) (time.Time, time.
 }
 
 type timeRangeBounds struct {
-	start        time.Time
-	end          time.Time
-	endExclusive bool
+	start          time.Time
+	startExclusive bool
+	end            time.Time
+	endExclusive   bool
 }
 
-// timeRangeBoundsFromExprs 提取时间范围及上界是否排除，供分表边界计算使用。
+// timeRangeBoundsFromExprs 提取时间范围及上下界是否排除，供分表边界计算使用。
 func timeRangeBoundsFromExprs(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
 	bounds, found := collectRangeBounds(exprs, key)
 	if !found || bounds.start.IsZero() || bounds.end.IsZero() {
@@ -204,15 +205,16 @@ func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBou
 	case clause.Gt, clause.Gte:
 		var column interface{}
 		var value interface{}
+		exclusive := false
 		switch condition := e.(type) {
 		case clause.Gt:
-			column, value = condition.Column, condition.Value
+			column, value, exclusive = condition.Column, condition.Value, true
 		case clause.Gte:
 			column, value = condition.Column, condition.Value
 		}
 		if columnMatches(column, key) {
 			if start, ok := asTime(value); ok {
-				return timeRangeBounds{start: start}, true
+				return timeRangeBounds{start: start, startExclusive: exclusive}, true
 			}
 		}
 	case clause.Lt, clause.Lte:
@@ -236,10 +238,14 @@ func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBou
 	return timeRangeBounds{}, false
 }
 
-// intersectRangeBounds 合并两个 AND 范围条件：下界取较晚值，上界取较早值。
+// intersectRangeBounds 合并两个 AND 范围条件：下界取较晚值，上界取较早值，并保留开闭边界。
 func intersectRangeBounds(left, right timeRangeBounds) timeRangeBounds {
 	if !right.start.IsZero() && (left.start.IsZero() || right.start.After(left.start)) {
 		left.start = right.start
+		left.startExclusive = right.startExclusive
+	} else if !right.start.IsZero() && right.start.Equal(left.start) {
+		// 相同下界时，只要任一条件为 >，合并后也必须保持开区间。
+		left.startExclusive = left.startExclusive || right.startExclusive
 	}
 	if !right.end.IsZero() {
 		if left.end.IsZero() || right.end.Before(left.end) {
@@ -364,6 +370,10 @@ func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key 
 		// AND 条件的下界取较晚值、上界取较早值，不能依赖条件书写顺序。
 		if !right.start.IsZero() && (left.start.IsZero() || right.start.After(left.start)) {
 			left.start = right.start
+			left.startExclusive = right.startExclusive
+		} else if !right.start.IsZero() && right.start.Equal(left.start) {
+			// 相同下界时，只要任一条件为 >，合并后也必须保持开区间。
+			left.startExclusive = left.startExclusive || right.startExclusive
 		}
 		if !right.end.IsZero() {
 			if left.end.IsZero() || right.end.Before(left.end) {
@@ -394,7 +404,9 @@ func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key 
 			return timeRangeBounds{}, false
 		}
 		switch e.Operator {
-		case sqlparser.GreaterThanOp, sqlparser.GreaterEqualOp:
+		case sqlparser.GreaterThanOp:
+			return timeRangeBounds{start: value, startExclusive: true}, true
+		case sqlparser.GreaterEqualOp:
 			return timeRangeBounds{start: value}, true
 		case sqlparser.LessThanOp:
 			return timeRangeBounds{end: value, endExclusive: true}, true
@@ -537,7 +549,7 @@ func columnCandidates(key string) []string {
 // tablesForRangeBounds 根据时间范围倒推出最多 MaxScanTables 张真实分表。
 func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
 	start, end := bounds.start, bounds.end
-	if end.Before(start) {
+	if end.Before(start) || (end.Equal(start) && (bounds.startExclusive || bounds.endExclusive)) {
 		// 原始 WHERE 条件必定为空集，不能交换边界后扫描无关的历史分表。
 		return nil
 	}
@@ -545,8 +557,8 @@ func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
 		// 上界恰好位于下一个分片起点时，该分片不属于 [start, end)。
 		end = end.Add(-time.Nanosecond)
 	}
-	if end.Before(start) || (end.Equal(start) && bounds.endExclusive) {
-		// 排他上界调整后，>= t AND < t 这类条件同样是空集，不能回退扫描历史分表。
+	if end.Before(start) {
+		// 排他上界跨越分片边界时会回退一个纳秒；回退后也可能形成空集。
 		return nil
 	}
 	out := make([]string, 0)

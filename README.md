@@ -9,7 +9,7 @@
 3. 插入时自动计算目标表，并在表不存在时使用 GORM `AutoMigrate` 自动创建。
 4. 批量插入会按目标分表自动拆分。
 5. 查询包含分表字段时精确路由；不包含分表字段时最多扫描最近 `MaxScanTables` 张表。
-6. 跨表查询在 Go 层合并结果，保持 GORM slice 返回体验。
+6. 跨表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
 7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
 9. 支持显式调用 `plugin.AutoMigrate(db, model)` 同步历史分表字段。
@@ -84,7 +84,7 @@ func main() {
 
 ```go
 type ShardingConfig struct {
-	// 分表字段，支持 Go 字段名或数据库列名，例如 CreatedAt 或 created_at。
+	// 分表字段的数据库列名，例如 created_at。
 	ShardingKey string
 
 	// 分表策略，决定表名后缀和最近表倒推粒度。
@@ -176,7 +176,9 @@ err := db.Where("name = ?", "alice").Find(&users).Error
 
 ### 跨分表聚合
 
-跨分表 `Count`、`SUM`、`MIN`、`MAX`、`AVG` 会在 MySQL 内通过 `UNION ALL` 合并原始行后统一计算，返回的是全部命中分表的结果。
+跨分表 `Count`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By`、`Having` 会由 MySQL 执行全局查询：插件使用 `UNION ALL` 合并各真实分表的原始行，再在外层保留原始 SQL 的 `SELECT`、聚合、分组、排序和分页。
+
+这样 `Find` 和 `Scan` 的结果可保持与单表 MySQL 查询一致，包括 `NULL` 语义、`COUNT(DISTINCT ...)`、加权 `AVG`、数据库排序规则和 `HAVING`。
 
 ```go
 var total int64
@@ -280,7 +282,7 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw/Exec 只支持执行在一张真实分表上的 SQL：`WHERE` 中的分表字段能精确定位一张表时，会路由到该表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`，不会静默只执行其中一张表。未包含可识别分表字段时，保持当前行为并使用最新真实分表。
+Raw/Exec 只支持执行在一张真实分表上的 SQL：`WHERE` 中的分表字段能精确定位一张表时，会路由到该表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`，不会静默只执行其中一张表。未包含可识别分表字段时，保持当前行为并使用最新真实分表。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到最新分表。
 
 不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。跨分表写操作请使用 GORM 的 `Updates` 或 `Delete`；跨分表读取请使用 `Find`。
 
@@ -343,11 +345,12 @@ go test ./... -run TestRequirement -count=1 -v
 2. 分表字段只支持 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`。
 3. 不支持 int 时间戳、字符串日期、SQL 表达式计算分表字段。
 4. 跨分表 Join 不支持。
-5. 跨分表 `Order`、`Offset`、`Limit` 已支持：插件会让每张分表先按相同排序取 `offset + limit` 行，再使用 `UNION ALL` 在 MySQL 外层统一排序和分页。仅适用于单模型、无 Join 的查询。
-6. 跨分表 `Group By` 与聚合已支持：插件先 `UNION ALL` 合并各真实分表的原始行，再在外层执行原始 `SELECT`、`GROUP BY`、`HAVING`、`ORDER BY` 与 `LIMIT`，因此常用的 `COUNT`、`SUM`、`MIN`、`MAX`、`AVG` 均由 MySQL 按全量数据计算。
-7. 跨分表 Group By、Order、Limit 不支持 Join 或手写逻辑表限定名，例如 `user.score`；请使用模型字段名或列名，例如 `score`。
+5. 跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行。
+6. 跨分表查询不支持 Join，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw SQL 只支持单个真实分表的表名改写；时间条件命中多分表、复杂 Join 均不支持。
 9. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
+10. 不要在事务内依赖 `AutoCreateTable` 创建首次分表。MySQL DDL 不能与业务 DML 保持同一提交/回滚边界，插件会在初始化 DB 连接上创建表；请在事务开始前预建目标分表。
+11. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
 
 ## 性能说明
 

@@ -107,12 +107,22 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 // resolveTablePrefixes 使用 GORM schema 解析注册模型的逻辑表名，作为真实分表前缀。
 func (p *Plugin) resolveTablePrefixes(db *gorm.DB) error {
 	cache := &sync.Map{}
+	prefixes := make(map[string]reflect.Type, len(p.configs))
 	for modelType, cfg := range p.configs {
 		model := reflect.New(modelType).Interface()
 		parsed, err := schema.Parse(model, cache, db.Config.NamingStrategy)
 		if err != nil {
 			return err
 		}
+		// ShardingKey 统一使用数据库列名，避免 Go 字段名与 SQL 条件列名不一致导致路由退化。
+		field := parsed.LookUpField(cfg.ShardingKey)
+		if field == nil || field.DBName != cfg.ShardingKey {
+			return fmt.Errorf("gorm_sharding: sharding key %s must be a database column name", cfg.ShardingKey)
+		}
+		if previous, exists := prefixes[parsed.Table]; exists {
+			return fmt.Errorf("gorm_sharding: models %s and %s use the same logical table %s", previous, modelType, parsed.Table)
+		}
+		prefixes[parsed.Table] = modelType
 		cfg.tablePrefix = parsed.Table
 		p.configs[modelType] = cfg
 	}
@@ -127,7 +137,7 @@ func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 			continue
 		}
 		// 需求要求无模板表，所以这里不迁移逻辑表，只迁移已经存在的历史分表。
-		if err := p.manager.autoMigrate(model, cfg); err != nil {
+		if err := p.manager.autoMigrate(db, model, cfg); err != nil {
 			return err
 		}
 	}
@@ -172,11 +182,7 @@ func (p *Plugin) create(db *gorm.DB) {
 	}
 	if len(groups) == 1 {
 		for table := range groups {
-			if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
-				db.AddError(err)
-				return
-			}
-			// 单分表插入只替换当前 Statement 的表名，后续交给 GORM 原始 create 回调。
+			// 单分表插入不预查元数据，直接执行；只有 MySQL 返回 1146 后才建表并重试。
 			setStatementTable(db, table)
 			p.createFn(db)
 			if isMissingTableError(db.Error) && cfg.AutoCreateTable {
@@ -197,10 +203,6 @@ func (p *Plugin) create(db *gorm.DB) {
 
 	var rows int64
 	for table, values := range groups {
-		if err := p.manager.ensure(db.Statement.Model, cfg, table); err != nil {
-			db.AddError(err)
-			return
-		}
 		// 批量数据可能分散到多张表，必须拆成多次 Create，并累加 RowsAffected。
 		// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
 		res, err := p.createShardValues(db, cfg, table, values.Interface())
@@ -289,59 +291,10 @@ func (p *Plugin) query(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
-	if isAggregateQuery(db) {
-		if err := p.executeCombinedQuery(db, tables); err != nil {
-			db.AddError(err)
-		}
-		return
-	}
-	if _, hasGroup := db.Statement.Clauses["GROUP BY"]; hasGroup {
-		if err := p.executeCombinedQuery(db, tables); err != nil {
-			db.AddError(err)
-		}
-		return
-	}
-	if _, hasLimit := db.Statement.Clauses["LIMIT"]; hasLimit {
-		if err := p.executeCombinedQuery(db, tables); err != nil {
-			db.AddError(err)
-		}
-		return
-	}
-	if _, hasOrder := db.Statement.Clauses["ORDER BY"]; hasOrder {
-		if err := p.executeCombinedQuery(db, tables); err != nil {
-			db.AddError(err)
-		}
-		return
-	}
-	scanInto := db.Statement.Dest
-	dst := reflect.ValueOf(scanInto)
-	if dst.Kind() != reflect.Ptr || dst.Elem().Kind() != reflect.Slice {
-		db.AddError(fmt.Errorf("gorm_sharding: cross table query destination must be slice pointer"))
-		return
-	}
-	total := reflect.MakeSlice(dst.Elem().Type(), 0, 0)
-	var rows int64
-	for _, table := range tables {
-		// 跨分表查询逐表执行，再把每张表扫描到的切片追加回原始目标切片。
-		item := reflect.New(dst.Elem().Type()).Interface()
-		tx := db.Session(&gorm.Session{NewDB: true}).Table(table)
-		copyQueryState(tx, db)
-		tx = tx.Set(skipKey, true)
-		if err := tx.Find(item).Error; err != nil {
-			if isMissingTableError(err) {
-				p.manager.invalidate(cfg, table)
-				continue
-			}
-			db.AddError(err)
-			return
-		}
-		rows += tx.RowsAffected
-		total = reflect.AppendSlice(total, reflect.ValueOf(item).Elem())
-	}
-	dst.Elem().Set(total)
-	db.RowsAffected = rows
-	if db.Statement.Result != nil {
-		db.Statement.Result.RowsAffected = rows
+	// 所有跨分表读取都由 MySQL 在合并原始行后统一执行。即使查询没有显式
+	// Order 或聚合，也不能依赖 Go 追加切片来模拟数据库的结果集和 Row 回调语义。
+	if err := p.executeCombinedQuery(db, cfg, tables); err != nil {
+		db.AddError(err)
 	}
 }
 
@@ -360,6 +313,10 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 	cfg, ok := p.configFor(db)
 	if !ok {
 		p.updateFn(db)
+		return
+	}
+	if updatesShardingKey(db, cfg) {
+		db.AddError(fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey))
 		return
 	}
 	tables := p.routeTables(db, cfg)
@@ -484,19 +441,12 @@ func (p *Plugin) row(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: join query is not supported"))
 		return
 	}
-	if !isAggregateQuery(db) && !hasGroupBy(db) {
-		db.AddError(fmt.Errorf("gorm_sharding: cross table row query must be aggregate or group query"))
-		return
-	}
-	sql, vars, err := p.buildCombinedQuery(db, tables)
-	if err != nil {
+	// Row 回调必须提供一个真实的 *sql.Rows。跨表时使用组合 SQL，
+	// 才能让 Scan、Rows、Row 与单表 GORM 回调保持相同的返回语义。
+	if err := p.executeCombinedRow(db, cfg, tables); err != nil {
 		db.AddError(err)
 		return
 	}
-	db.Statement.SQL.Reset()
-	db.Statement.SQL.WriteString(sql)
-	db.Statement.Vars = vars
-	p.rowFn(db)
 }
 
 // setStatementTable 把当前 GORM Statement 的逻辑表切换成真实分表。

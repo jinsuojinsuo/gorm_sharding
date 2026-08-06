@@ -17,7 +17,7 @@ type ShardingStrategy interface {
 
 // ShardingConfig 定义单个模型的分表配置。
 type ShardingConfig struct {
-	// ShardingKey 是分表字段，支持 Go 字段名或数据库列名，例如 CreatedAt 或 created_at。
+	// ShardingKey 是分表字段的数据库列名，例如 created_at。
 	ShardingKey string
 
 	// Strategy 是分表策略，决定表名后缀和倒推扫描粒度。

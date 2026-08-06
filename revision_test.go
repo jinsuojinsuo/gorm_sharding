@@ -1,13 +1,12 @@
 package gorm_sharding
 
 import (
-	"strings"
+	"math"
 	"testing"
 	"time"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"gorm.io/gorm/callbacks"
 	"gorm.io/gorm/clause"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -19,6 +18,24 @@ type revisionDistinctUser struct {
 	CreatedAt time.Time `gorm:"column:created_at;type:datetime;not null;index"`
 	UpdatedAt time.Time `gorm:"column:updated_at;type:datetime;not null"`
 }
+
+// revisionDuplicateUser 和 revisionDuplicateOrder 故意使用同一逻辑表名，用于初始化校验测试。
+type revisionDuplicateUser struct {
+	ID        uint64
+	CreatedAt time.Time
+}
+
+// TableName 返回重复测试使用的逻辑表名。
+func (revisionDuplicateUser) TableName() string { return "gs_req_revision_duplicate" }
+
+// revisionDuplicateOrder 是与 revisionDuplicateUser 不同的模型类型。
+type revisionDuplicateOrder struct {
+	ID        uint64
+	CreatedAt time.Time
+}
+
+// TableName 返回与 revisionDuplicateUser 相同的逻辑表名。
+func (revisionDuplicateOrder) TableName() string { return "gs_req_revision_duplicate" }
 
 // TableName 返回 DISTINCT 验收测试的独立逻辑表名，避免清理其他测试表。
 func (revisionDistinctUser) TableName() string {
@@ -75,6 +92,26 @@ func TestHalfOpenRangeWithOneShardScansStartShard(t *testing.T) {
 	}
 }
 
+// TestRangeRouteUsesIntersectionBounds 验证多个范围条件按交集计算，避免条件顺序导致漏扫。
+func TestRangeRouteUsesIntersectionBounds(t *testing.T) {
+	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	day1 := time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	day3 := day1.AddDate(0, 0, 2)
+	day4 := day1.AddDate(0, 0, 3)
+
+	tables, ok := tablesFromExprs([]clause.Expression{clause.Expr{
+		SQL:  "created_at >= ? AND created_at >= ? AND created_at < ? AND created_at < ?",
+		Vars: []interface{}{day1, day2, day4, day3},
+	}}, cfg, "created_at")
+	if !ok {
+		t.Fatal("range intersection was not recognized")
+	}
+	if want := []string{"user_20260802"}; !sameStrings(tables, want) {
+		t.Fatalf("tables = %v, want %v", tables, want)
+	}
+}
+
 // TestRawStatementRoutesHistoricalExactTime 防止 Raw 查询忽略时间条件而固定路由到最新分表。
 func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
 	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
@@ -116,63 +153,6 @@ func TestRouteParsesSliceArgumentIn(t *testing.T) {
 	}, cfg, "created_at")
 	if !ok || !sameStrings(tables, []string{"user_20260802", "user_20260803"}) {
 		t.Fatalf("tables = %v, routed = %v", tables, ok)
-	}
-}
-
-// TestCombinedQueryBuildsGlobalOrderAndLimit 验证跨分表排序和分页使用 MySQL 外层统一处理。
-func TestCombinedQueryBuildsGlobalOrderAndLimit(t *testing.T) {
-	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
-		DisableAutomaticPing: true,
-	})
-	if err != nil {
-		t.Fatalf("open dry-run database: %v", err)
-	}
-	plugin := New()
-	plugin.queryFn = callbacks.Query
-	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
-	query := db.Model(&requirementUser{}).
-		Where("created_at BETWEEN ? AND ?", start, start.AddDate(0, 0, 1)).
-		Order("score DESC").
-		Offset(1).
-		Limit(2)
-
-	sql, vars, err := plugin.buildCombinedQuery(query, []string{"gs_req_user_20260802", "gs_req_user_20260803"})
-	if err != nil {
-		t.Fatalf("build combined query: %v", err)
-	}
-	if !strings.Contains(sql, "union all") {
-		t.Fatalf("combined SQL does not contain UNION ALL: %s", sql)
-	}
-	if !strings.Contains(sql, "order by score desc limit 1, 2") {
-		t.Fatalf("combined SQL does not contain outer order and limit: %s", sql)
-	}
-	if len(vars) != 4 || vars[0] != start || vars[2] != start {
-		t.Fatalf("combined vars = %#v, want duplicated range variables", vars)
-	}
-}
-
-// TestCombinedQueryBuildsGlobalGroupBy 验证跨分表分组在 UNION ALL 外层完成聚合。
-func TestCombinedQueryBuildsGlobalGroupBy(t *testing.T) {
-	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
-		DisableAutomaticPing: true,
-	})
-	if err != nil {
-		t.Fatalf("open dry-run database: %v", err)
-	}
-	plugin := New()
-	plugin.queryFn = callbacks.Query
-	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
-	query := db.Model(&requirementUser{}).
-		Select("name, COUNT(*) AS total").
-		Where("created_at BETWEEN ? AND ?", start, start.AddDate(0, 0, 1)).
-		Group("name")
-
-	sql, _, err := plugin.buildCombinedQuery(query, []string{"gs_req_user_20260802", "gs_req_user_20260803"})
-	if err != nil {
-		t.Fatalf("build combined query: %v", err)
-	}
-	if !strings.Contains(sql, "union all") || !strings.Contains(sql, "count(*) as total") || !strings.Contains(sql, "group by") {
-		t.Fatalf("combined group SQL = %s", sql)
 	}
 }
 
@@ -221,5 +201,446 @@ func TestRevisionCrossShardCountDistinct(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("cross-shard distinct count = %d, want 2", count)
+	}
+}
+
+// TestCombinedQueryRetriesAfterMissingShard 验证组合查询在 SQL 返回 1146 后会跳过不存在的中间分表并重试一次。
+func TestCombinedQueryRetriesAfterMissingShard(t *testing.T) {
+	prefix := revisionDistinctUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 3, revisionDistinctUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day3 := day1.AddDate(0, 0, 2)
+	if err := db.Create(&revisionDistinctUser{Name: "first", CreatedAt: day1, UpdatedAt: day1}).Error; err != nil {
+		t.Fatalf("create first shard row: %v", err)
+	}
+	if err := db.Create(&revisionDistinctUser{Name: "last", CreatedAt: day3, UpdatedAt: day3}).Error; err != nil {
+		t.Fatalf("create last shard row: %v", err)
+	}
+
+	var users []revisionDistinctUser
+	result := db.Where("created_at BETWEEN ? AND ?", day1, day3).
+		Order("created_at ASC").
+		Find(&users)
+	if result.Error != nil {
+		t.Fatalf("combined query with missing middle shard: %v", result.Error)
+	}
+	if len(users) != 2 || users[0].Name != "first" || users[1].Name != "last" {
+		t.Fatalf("combined rows = %+v, want first and last rows", users)
+	}
+}
+
+// TestCrossShardOrderLimitScan 验证 Scan 与 Find 一样支持跨分表排序和分页。
+func TestCrossShardOrderLimitScan(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "low", Score: 10, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "high", Score: 20, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create scan rows: %v", err)
+	}
+
+	var users []requirementUser
+	result := db.Model(&requirementUser{}).
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Order("score DESC").
+		Limit(1).
+		Scan(&users)
+	if result.Error != nil {
+		t.Fatalf("cross-shard scan with order and limit: %v", result.Error)
+	}
+	if len(users) != 1 || users[0].Name != "high" {
+		t.Fatalf("scan rows = %+v, want high row only", users)
+	}
+}
+
+// TestInitializeRejectsDuplicateLogicalTableName 验证不同模型不能注册为同一个逻辑表名。
+func TestInitializeRejectsDuplicateLogicalTableName(t *testing.T) {
+	plugin := New()
+	for _, model := range []interface{}{revisionDuplicateUser{}, revisionDuplicateOrder{}} {
+		if err := plugin.Register(model, ShardingConfig{
+			ShardingKey:   "created_at",
+			Strategy:      DayStrategy,
+			MaxScanTables: 1,
+		}); err != nil {
+			t.Fatalf("register model: %v", err)
+		}
+	}
+
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	if err := plugin.Initialize(db); err == nil {
+		t.Fatal("initialize with duplicate logical table name returned nil")
+	}
+}
+
+// TestInitializeRejectsGoFieldNameAsShardingKey 验证 ShardingKey 只能填写数据库列名。
+func TestInitializeRejectsGoFieldNameAsShardingKey(t *testing.T) {
+	plugin := New()
+	if err := plugin.Register(revisionDistinctUser{}, ShardingConfig{
+		ShardingKey:   "CreatedAt",
+		Strategy:      DayStrategy,
+		MaxScanTables: 1,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{DisableAutomaticPing: true})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	if err := plugin.Initialize(db); err == nil {
+		t.Fatal("initialize with Go field name sharding key returned nil")
+	}
+}
+
+// TestCombinedQueryRetriesWithOneRemainingShard 验证 1146 恢复后只剩一张表时退回普通单表查询。
+func TestCombinedQueryRetriesWithOneRemainingShard(t *testing.T) {
+	prefix := revisionDistinctUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 3, revisionDistinctUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day3 := day1.AddDate(0, 0, 2)
+	if err := db.Create(&revisionDistinctUser{Name: "only", CreatedAt: day1, UpdatedAt: day1}).Error; err != nil {
+		t.Fatalf("create only shard row: %v", err)
+	}
+
+	var users []revisionDistinctUser
+	result := db.Where("created_at BETWEEN ? AND ?", day1, day3).Order("created_at ASC").Find(&users)
+	if result.Error != nil {
+		t.Fatalf("combined query with one remaining shard: %v", result.Error)
+	}
+	if len(users) != 1 || users[0].Name != "only" {
+		t.Fatalf("combined rows = %+v, want only row", users)
+	}
+}
+
+// TestUpdateRejectsShardingKey 验证 GORM 更新不能修改分表字段，避免记录留在错误物理分表。
+func TestUpdateRejectsShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	user := requirementUser{Name: "locked", CreatedAt: day1, UpdatedAt: day1}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	result := db.Model(&requirementUser{}).
+		Where("id = ? AND created_at = ?", user.ID, day1).
+		Updates(map[string]interface{}{"created_at": day2})
+	if result.Error == nil {
+		t.Fatal("update sharding key returned nil")
+	}
+}
+
+// TestSaveRejectsShardingKey 验证 Save 不会隐式把记录更新到错误的物理分表。
+func TestSaveRejectsShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	user := requirementUser{Name: "save", CreatedAt: day1, UpdatedAt: day1}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	user.CreatedAt = day2
+	if result := db.Save(&user); result.Error == nil {
+		t.Fatal("save with changed sharding key returned nil")
+	}
+}
+
+// TestRawUpdateRejectsShardingKey 验证 Raw UPDATE 不能修改分表字段。
+func TestRawUpdateRejectsShardingKey(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&requirementUser{Name: "raw-update", CreatedAt: day1, UpdatedAt: day1}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	result := db.Exec("UPDATE gs_req_user SET created_at = ? WHERE created_at = ?", day2, day1)
+	if result.Error == nil {
+		t.Fatal("raw update with changed sharding key returned nil")
+	}
+}
+
+// TestRawInsertIntoLogicalTableIsRejected 验证 Raw INSERT 不会把历史数据静默写进最新分表。
+func TestRawInsertIntoLogicalTableIsRejected(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	now := time.Now()
+	if err := db.Create(&requirementUser{Name: "current", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("create current row: %v", err)
+	}
+	result := db.Exec(
+		"INSERT INTO gs_req_user (name, score, created_at, updated_at) VALUES (?, ?, ?, ?)",
+		"historical", 1, now.AddDate(0, 0, -7), now,
+	)
+	if result.Error == nil {
+		t.Fatal("raw insert into logical table returned nil")
+	}
+}
+
+// TestCrossShardDistinctFindIsGlobal 验证普通 Distinct Find 在全部命中分表上统一去重。
+func TestCrossShardDistinctFindIsGlobal(t *testing.T) {
+	prefix := revisionDistinctUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, revisionDistinctUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]revisionDistinctUser{
+		{Name: "same", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "same", CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create distinct rows: %v", err)
+	}
+
+	var names []string
+	result := db.Model(&revisionDistinctUser{}).
+		Distinct("name").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Find(&names)
+	if result.Error != nil {
+		t.Fatalf("cross-shard distinct find: %v", result.Error)
+	}
+	if len(names) != 1 || names[0] != "same" {
+		t.Fatalf("distinct names = %v, want [same]", names)
+	}
+}
+
+// TestCrossShardCountIgnoresLimit 验证跨分表 COUNT 不会被明细分页截断。
+func TestCrossShardCountIgnoresLimit(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "a", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "b", Score: 2, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "c", Score: 3, CreatedAt: day2, UpdatedAt: day2},
+		{Name: "d", Score: 4, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create count rows: %v", err)
+	}
+
+	var count int64
+	result := db.Model(&requirementUser{}).
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Limit(1).
+		Count(&count)
+	if result.Error != nil {
+		t.Fatalf("cross-shard count with limit: %v", result.Error)
+	}
+	if count != 4 {
+		t.Fatalf("cross-shard count = %d, want 4", count)
+	}
+}
+
+// TestCrossShardDistinctLimitKeepsUniqueRows 验证跨分表 DISTINCT 分页不会被分表内重复值截断。
+func TestCrossShardDistinctLimitKeepsUniqueRows(t *testing.T) {
+	prefix := revisionDistinctUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, revisionDistinctUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]revisionDistinctUser{
+		{Name: "a", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "a", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "b", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "c", CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create distinct limit rows: %v", err)
+	}
+
+	var names []string
+	result := db.Model(&revisionDistinctUser{}).
+		Distinct("name").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Order("name ASC").
+		Limit(2).
+		Find(&names)
+	if result.Error != nil {
+		t.Fatalf("cross-shard distinct limit: %v", result.Error)
+	}
+	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
+		t.Fatalf("distinct names = %v, want [a b]", names)
+	}
+}
+
+// TestCrossShardAggregateStats 验证 SUM、MIN、MAX、AVG 在多个分表上的最终结果由 Go 正确合并。
+func TestCrossShardAggregateStats(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "a", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "b", Score: 2, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "c", Score: 10, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create aggregate rows: %v", err)
+	}
+
+	type stats struct {
+		Total int64
+		Min   int
+		Max   int
+		Avg   float64
+	}
+	var got stats
+	result := db.Model(&requirementUser{}).
+		Select("SUM(score) AS total, MIN(score) AS min, MAX(score) AS max, AVG(score) AS avg").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Find(&got)
+	if result.Error != nil {
+		t.Fatalf("cross-shard aggregate: %v", result.Error)
+	}
+	if got.Total != 13 || got.Min != 1 || got.Max != 10 || got.Avg != 13.0/3.0 {
+		t.Fatalf("aggregate = %+v, want total=13 min=1 max=10 avg=%v", got, 13.0/3.0)
+	}
+}
+
+// TestCrossShardGroupBy 验证跨分表分组由 MySQL 全局执行并返回正确结果。
+func TestCrossShardGroupBy(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "alice", Score: 1, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "alice", Score: 2, CreatedAt: day2, UpdatedAt: day2},
+		{Name: "bob", Score: 3, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create group rows: %v", err)
+	}
+
+	type group struct {
+		Name  string
+		Total int64
+	}
+	var got []group
+	result := db.Model(&requirementUser{}).
+		Select("name, COUNT(*) AS total").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Group("name").
+		Order("name ASC").
+		Find(&got)
+	if result.Error != nil {
+		t.Fatalf("cross-shard group: %v", result.Error)
+	}
+	if len(got) != 2 || got[0].Name != "alice" || got[0].Total != 2 || got[1].Name != "bob" || got[1].Total != 1 {
+		t.Fatalf("groups = %+v, want alice=2 and bob=1", got)
+	}
+}
+
+// TestCrossShardScanGroupAggregateSemantics 验证 Scan、HAVING、COUNT(DISTINCT) 与 AVG
+// 由 MySQL 在全部分表原始行上统一计算，结果与单表 SQL 语义一致。
+func TestCrossShardScanGroupAggregateSemantics(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementUser{
+		{Name: "alice", Score: 7, CreatedAt: day1, UpdatedAt: day1},
+		{Name: "alice", Score: 7, CreatedAt: day2, UpdatedAt: day2},
+		{Name: "alice", Score: 9, CreatedAt: day2, UpdatedAt: day2},
+		{Name: "bob", Score: 3, CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create aggregate semantic rows: %v", err)
+	}
+
+	type groupStats struct {
+		Name          string
+		Total         int64
+		DistinctScore int64
+		Sum           int64
+		Min           int
+		Max           int
+		Avg           float64
+	}
+	var got []groupStats
+	result := db.Model(&requirementUser{}).
+		Select("name, COUNT(*) AS total, COUNT(DISTINCT score) AS distinct_score, SUM(score) AS sum, MIN(score) AS min, MAX(score) AS max, AVG(score) AS avg").
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Group("name").
+		Having("COUNT(*) > ?", 2).
+		Order("name ASC").
+		Scan(&got)
+	if result.Error != nil {
+		t.Fatalf("cross-shard scan group aggregate: %v", result.Error)
+	}
+	if len(got) != 1 {
+		t.Fatalf("group aggregate rows = %+v, want one alice row", got)
+	}
+	row := got[0]
+	if row.Name != "alice" || row.Total != 3 || row.DistinctScore != 2 || row.Sum != 23 || row.Min != 7 || row.Max != 9 || math.Abs(row.Avg-23.0/3.0) > 0.0001 {
+		t.Fatalf("group aggregate = %+v, want alice total=3 distinct=2 sum=23 min=7 max=9 avg=%v", row, 23.0/3.0)
+	}
+}
+
+// TestCrossShardRowsUsesGlobalQuery 验证 Rows 也使用跨分表全局 SQL，而不是仅支持 Find 或 Scan。
+func TestCrossShardRowsUsesGlobalQuery(t *testing.T) {
+	prefix := revisionDistinctUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, revisionDistinctUser{})
+	defer cleanup()
+
+	day1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	if err := db.Create(&[]revisionDistinctUser{
+		{Name: "first", CreatedAt: day1, UpdatedAt: day1},
+		{Name: "second", CreatedAt: day2, UpdatedAt: day2},
+	}).Error; err != nil {
+		t.Fatalf("create rows query data: %v", err)
+	}
+
+	rows, err := db.Model(&revisionDistinctUser{}).
+		Where("created_at BETWEEN ? AND ?", day1, day2).
+		Order("name ASC").
+		Rows()
+	if err != nil {
+		t.Fatalf("cross-shard Rows: %v", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var user revisionDistinctUser
+		if err := db.ScanRows(rows, &user); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		names = append(names, user.Name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate rows: %v", err)
+	}
+	if !sameStrings(names, []string{"first", "second"}) {
+		t.Fatalf("rows names = %v, want [first second]", names)
 	}
 }

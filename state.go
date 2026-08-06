@@ -9,6 +9,8 @@ func copyQueryState(dst, src *gorm.DB) {
 	dst.Statement.Clauses = src.Statement.Clauses
 	dst.Statement.Selects = src.Statement.Selects
 	dst.Statement.Omits = src.Statement.Omits
+	// Distinct 是 Statement 独立状态，组合查询的 DryRun 构建也必须保留全局去重语义。
+	dst.Statement.Distinct = src.Statement.Distinct
 	dst.Statement.Joins = src.Statement.Joins
 	dst.Statement.Preloads = src.Statement.Preloads
 	dst.Statement.Settings = src.Statement.Settings

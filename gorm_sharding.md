@@ -583,6 +583,12 @@ Go合并：
 
 # 14. Order + Limit 查询
 
+## 一致性原则
+
+跨分表查询的首要目标是与同一份数据存放在单表时的 MySQL/GORM 结果一致。代码量和单次查询性能不能改变 SQL 语义。
+
+因此，所有跨分表读取统一使用 MySQL 外层查询完成最终计算，包括 `Find`、`Scan`、`Rows`、`Order`、`Offset`、`Limit`、`Distinct`、`COUNT(DISTINCT ...)`、`SUM`、`MIN`、`MAX`、`AVG`、`Group By` 与 `Having`。只有经过等价性测试验证且不改变结果集语义的操作才允许逐表优化。
+
 
 如果：
 
@@ -624,11 +630,11 @@ LIMIT 20
 
 原因：
 
-每个分表先取Top N，避免全表扫描。
+每个分表先取 Top N，避免不必要的明细行读取；外层 MySQL 负责最终排序和分页，保证结果与单表查询一致。
 
 支持 Offset：每张分表先取 `Offset + Limit` 行，外层再统一执行原 Offset 和 Limit。
 
-跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、SUM、MIN、MAX、AVG 按全部命中分表的数据计算。
+跨分表 Group By 和聚合也通过相同的 UNION ALL 外层查询实现：内层合并各真实分表原始行，外层执行原始 SELECT、GROUP BY、HAVING、ORDER BY、LIMIT，因此 COUNT、COUNT(DISTINCT)、SUM、MIN、MAX、AVG 按全部命中分表的数据计算，并保留 MySQL 的 NULL、排序规则和 HAVING 语义。
 
 限制：只支持单模型、无 Join 的 GORM 查询；Group、Order、Select、Having 中不要手写逻辑表限定名，例如 `user.score`，应使用 `score`。
 

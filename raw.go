@@ -81,6 +81,13 @@ func (p *Plugin) rewriteTableName(table *sqlparser.TableName, stmt sqlparser.Sta
 	if !ok {
 		return false, nil
 	}
+	if _, ok := stmt.(*sqlparser.Insert); ok {
+		// INSERT 的分表字段位于 VALUES，当前 Raw 路由不会解析值列表，禁止静默写入最新分表。
+		return false, fmt.Errorf("gorm_sharding: raw insert into sharded table is not supported; use Create")
+	}
+	if update, ok := stmt.(*sqlparser.Update); ok && rawUpdateChangesShardingKey(update, cfg.ShardingKey) {
+		return false, fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey)
+	}
 	targets, routed := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
 	if routed && len(targets) != 1 {
 		return false, fmt.Errorf("gorm_sharding: raw SQL across shards is not supported")
@@ -94,6 +101,16 @@ func (p *Plugin) rewriteTableName(table *sqlparser.TableName, stmt sqlparser.Sta
 	}
 	table.Name = sqlparser.NewIdentifierCS(targets[0])
 	return true, nil
+}
+
+// rawUpdateChangesShardingKey 判断 Raw UPDATE 的 SET 子句是否修改了分表字段。
+func rawUpdateChangesShardingKey(update *sqlparser.Update, key string) bool {
+	for _, assignment := range update.Exprs {
+		if assignment != nil && assignment.Name != nil && normalizeColumnName(assignment.Name.Name.String()) == normalizeColumnName(key) {
+			return true
+		}
+	}
+	return false
 }
 
 // configByPrefix 根据 Raw SQL 中出现的逻辑表名找到分表配置。

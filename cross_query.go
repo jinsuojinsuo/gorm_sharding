@@ -11,16 +11,56 @@ import (
 )
 
 // executeCombinedQuery 使用 UNION ALL 在 MySQL 内完成跨分表排序、分页和分组聚合。
-func (p *Plugin) executeCombinedQuery(db *gorm.DB, tables []string) error {
-	sql, vars, err := p.buildCombinedQuery(db, tables)
-	if err != nil {
+func (p *Plugin) executeCombinedQuery(db *gorm.DB, cfg ShardingConfig, tables []string) error {
+	return p.executeCombined(db, cfg, tables, p.queryFn)
+}
+
+// executeCombinedRow 使用 UNION ALL 执行跨分表 Scan、Rows 或 Row 回调支持的聚合查询。
+func (p *Plugin) executeCombinedRow(db *gorm.DB, cfg ShardingConfig, tables []string) error {
+	return p.executeCombined(db, cfg, tables, p.rowFn)
+}
+
+// executeCombined 执行组合 SQL；首次执行返回 1146 时才检查候选表并至多重试一次。
+func (p *Plugin) executeCombined(db *gorm.DB, cfg ShardingConfig, tables []string, execute func(*gorm.DB)) error {
+	run := func(targets []string) error {
+		sql, vars, err := p.buildCombinedQuery(db, targets)
+		if err != nil {
+			return err
+		}
+		db.Statement.SQL.Reset()
+		db.Statement.SQL.WriteString(sql)
+		db.Statement.Vars = vars
+		execute(db)
+		return db.Error
+	}
+
+	err := run(tables)
+	if !isMissingTableError(err) {
 		return err
 	}
-	db.Statement.SQL.Reset()
-	db.Statement.SQL.WriteString(sql)
-	db.Statement.Vars = vars
-	p.queryFn(db)
-	return db.Error
+
+	// 遵循“先执行 SQL”的策略：只有 MySQL 返回 1146 后才读取元数据并剔除已不存在的分表。
+	retryTables := p.manager.existingAfterMissing(cfg, tables)
+	if len(retryTables) == len(tables) {
+		return err
+	}
+	db.Error = nil
+	db.RowsAffected = 0
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = 0
+	}
+	if len(retryTables) == 0 {
+		return nil
+	}
+	if len(retryTables) == 1 {
+		// 组合查询退化为单表后交回原始回调，避免 buildCombinedQuery 拒绝单表输入。
+		db.Statement.SQL.Reset()
+		db.Statement.Vars = nil
+		setStatementTable(db, retryTables[0])
+		execute(db)
+		return db.Error
+	}
+	return run(retryTables)
 }
 
 // buildCombinedQuery 把 GORM 单表 SELECT 改写为“内层分表 UNION ALL，外层保留原查询语义”的 SQL。

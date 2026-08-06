@@ -314,12 +314,18 @@ func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key 
 		if !rightOK {
 			return left, true
 		}
-		if !right.start.IsZero() {
+		// AND 条件的下界取较晚值、上界取较早值，不能依赖条件书写顺序。
+		if !right.start.IsZero() && (left.start.IsZero() || right.start.After(left.start)) {
 			left.start = right.start
 		}
 		if !right.end.IsZero() {
-			left.end = right.end
-			left.endExclusive = right.endExclusive
+			if left.end.IsZero() || right.end.Before(left.end) {
+				left.end = right.end
+				left.endExclusive = right.endExclusive
+			} else if right.end.Equal(left.end) {
+				// 相同上界时，只要任一条件为 <，合并后也必须保持开区间。
+				left.endExclusive = left.endExclusive || right.endExclusive
+			}
 		}
 		return left, true
 	case *sqlparser.BetweenExpr:
@@ -494,13 +500,15 @@ func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
 	out := make([]string, 0)
 	seen := make(map[string]struct{})
 	cursor := end
+	startTable := cfg.tableName(start)
 	for i := 0; i < cfg.MaxScanTables; i++ {
 		table := cfg.tableName(cursor)
 		if _, ok := seen[table]; !ok {
 			out = append(out, table)
 			seen[table] = struct{}{}
 		}
-		if !cursor.After(start) {
+		// 已经包含起始分片后立即停止；比较具体时间会在半开区间中多退一张表。
+		if table == startTable {
 			break
 		}
 		// 从结束时间往前推，能优先命中较新的分表，并受 MaxScanTables 保护。

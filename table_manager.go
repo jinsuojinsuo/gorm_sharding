@@ -50,6 +50,22 @@ func (m *tableManager) invalidate(cfg ShardingConfig, table string) {
 	m.clearTableListCache(cfg)
 }
 
+// existingAfterMissing 在 SQL 返回 1146 后刷新候选表缓存，并返回仍然存在的真实分表。
+func (m *tableManager) existingAfterMissing(cfg ShardingConfig, candidates []string) []string {
+	for _, table := range candidates {
+		m.seen.Delete(table)
+	}
+	m.clearTableListCache(cfg)
+
+	existing := make([]string, 0, len(candidates))
+	for _, table := range candidates {
+		if m.exists(table) {
+			existing = append(existing, table)
+		}
+	}
+	return existing
+}
+
 // isMissingTableError 判断错误是否是 MySQL 1146 表不存在错误。
 func isMissingTableError(err error) bool {
 	var mysqlErr *mysqlDriver.MySQLError
@@ -150,19 +166,35 @@ func tableNameLikePattern(prefix string) string {
 	return escaped + "\\_%"
 }
 
-// autoMigrate 对已经存在的历史分表逐张执行 GORM AutoMigrate。
-func (m *tableManager) autoMigrate(model interface{}, cfg ShardingConfig) error {
-	tables, err := m.existingTables(cfg)
+// autoMigrate 使用调用方传入的 DB 对已经存在的历史分表逐张执行 GORM AutoMigrate。
+func (m *tableManager) autoMigrate(db *gorm.DB, model interface{}, cfg ShardingConfig) error {
+	if db == nil {
+		return fmt.Errorf("gorm_sharding: AutoMigrate database is nil")
+	}
+	tables, err := m.existingTablesWithDB(db, cfg)
 	if err != nil {
 		return err
 	}
 	for _, table := range tables {
 		// 历史分表逐张迁移，保证新增字段同步到已经存在的真实表。
-		if err := m.db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
+		if err := db.Session(&gorm.Session{NewDB: true}).Table(table).AutoMigrate(model); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// existingTablesWithDB 使用指定 DB 查询真实分表，供显式 AutoMigrate 保持调用方连接语义。
+func (m *tableManager) existingTablesWithDB(db *gorm.DB, cfg ShardingConfig) ([]string, error) {
+	if db.Dialector.Name() != "mysql" {
+		return nil, fmt.Errorf("gorm_sharding: only mysql table scan is supported")
+	}
+	var tables []string
+	err := db.Raw(
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
+		tableNameLikePattern(cfg.tablePrefix), cfg.MaxScanTables,
+	).Scan(&tables).Error
+	return tables, err
 }
 
 // elemAt 返回指针、切片或数组中的第 i 个实际元素。

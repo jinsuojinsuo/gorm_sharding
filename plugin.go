@@ -327,6 +327,15 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		db.AddError(fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey))
 		return
 	}
+	groups, grouped, err := p.groupUpdateValues(db, cfg)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
+	if grouped {
+		p.execUpdateGroups(db, cfg, groups)
+		return
+	}
 	tables := p.routeWriteTables(db, cfg)
 	if len(tables) == 0 {
 		setEmptyWriteResult(db)
@@ -353,6 +362,42 @@ func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
 		copyWriteState(tx, db)
 		tx = tx.Set(skipKey, true)
 		tx = tx.Model(db.Statement.Model).Updates(db.Statement.Dest)
+		if tx.Error != nil {
+			if isMissingTableError(tx.Error) {
+				p.manager.invalidate(cfg, table)
+				continue
+			}
+			db.AddError(tx.Error)
+			return
+		}
+		rows += tx.RowsAffected
+	}
+	db.RowsAffected = rows
+	if db.Statement.Result != nil {
+		db.Statement.Result.RowsAffected = rows
+	}
+}
+
+// execUpdateGroups 按真实分表执行批量实体更新，避免跨分表切片按首元素错误路由。
+func (p *Plugin) execUpdateGroups(db *gorm.DB, cfg ShardingConfig, groups map[string]reflect.Value) {
+	if len(groups) == 1 {
+		for table := range groups {
+			setStatementTable(db, table)
+			p.updateFn(db)
+			if p.handleMissingTable(db, cfg, table) {
+				return
+			}
+			return
+		}
+	}
+	if err := crossShardWriteLimitError(db); err != nil {
+		db.AddError(err)
+		return
+	}
+
+	var rows int64
+	for table, values := range groups {
+		tx := p.updateShardValues(db, table, values.Interface())
 		if tx.Error != nil {
 			if isMissingTableError(tx.Error) {
 				p.manager.invalidate(cfg, table)

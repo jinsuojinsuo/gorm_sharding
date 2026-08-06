@@ -322,6 +322,73 @@ func TestGroupDeleteValuesByShard(t *testing.T) {
 	}
 }
 
+// TestGroupUpdateValuesByShard 验证批量 Updates 会按每个模型实体的分表时间分组。
+func TestGroupUpdateValuesByShard(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{
+		DisableAutomaticPing: true,
+	})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+	if err := db.Statement.Parse(&revisionDistinctUser{}); err != nil {
+		t.Fatalf("parse update model: %v", err)
+	}
+	first := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
+	second := first.AddDate(0, 0, 1)
+	db.Statement.ReflectValue = reflect.ValueOf([]revisionDistinctUser{
+		{ID: 1, CreatedAt: first},
+		{ID: 2, CreatedAt: second},
+	})
+	cfg := ShardingConfig{tablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
+
+	groups, grouped, err := New().groupUpdateValues(db, cfg)
+	if err != nil || !grouped {
+		t.Fatalf("groups = %v, grouped = %v, err = %v", groups, grouped, err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("group count = %d, want 2", len(groups))
+	}
+	if group := groups["user_20260802"]; group.Len() != 1 || group.Index(0).FieldByName("ID").Uint() != 1 {
+		t.Fatalf("first shard group = %v", group)
+	}
+	if group := groups["user_20260803"]; group.Len() != 1 || group.Index(0).FieldByName("ID").Uint() != 2 {
+		t.Fatalf("second shard group = %v", group)
+	}
+}
+
+// TestBatchEntityUpdatesAcrossShards 验证批量实体 Updates 按分表分组后只使用本分表实体的主键条件。
+func TestBatchEntityUpdatesAcrossShards(t *testing.T) {
+	prefix := requirementUser{}.TableName()
+	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
+	defer cleanup()
+
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	second := first.AddDate(0, 0, 1)
+	users := []requirementUser{
+		{Name: "first", Score: 1, CreatedAt: first, UpdatedAt: first},
+		{Name: "second", Score: 2, CreatedAt: second, UpdatedAt: second},
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatalf("create batch update rows: %v", err)
+	}
+
+	result := db.Model(&users).Updates(map[string]interface{}{"score": 100})
+	if result.Error != nil {
+		t.Fatalf("batch entity updates: %v", result.Error)
+	}
+	if result.RowsAffected != 2 {
+		t.Fatalf("batch entity updates RowsAffected = %d, want 2", result.RowsAffected)
+	}
+
+	var got []requirementUser
+	if err := db.Where("created_at BETWEEN ? AND ?", first, second).Order("created_at ASC").Find(&got).Error; err != nil {
+		t.Fatalf("find batch update rows: %v", err)
+	}
+	if len(got) != 2 || got[0].Score != 100 || got[1].Score != 100 {
+		t.Fatalf("batch entity updated rows = %+v, want two rows with score 100", got)
+	}
+}
+
 // TestReverseRangeReturnsEmptyResult 验证矛盾范围的 Find、Scan、Update 都返回空结果且不访问逻辑表。
 func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 	prefix := requirementUser{}.TableName()

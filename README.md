@@ -273,6 +273,12 @@ res := db.Model(&User{}).
 		"score":      120,
 		"updated_at": time.Now(),
 	})
+
+// 批量实体更新会按每个模型实体的 CreatedAt 自动分组到对应分表。
+res = db.Model(&[]User{
+	{ID: 1, CreatedAt: firstCreatedAt},
+	{ID: 2, CreatedAt: secondCreatedAt},
+}).Updates(map[string]interface{}{"score": 120})
 ```
 
 ### 删除

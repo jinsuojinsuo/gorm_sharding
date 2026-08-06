@@ -449,7 +449,9 @@ func (p *Plugin) row(db *gorm.DB) {
 	}
 	tables := p.routeReadTables(db, cfg)
 	if len(tables) == 0 {
-		p.executeEmptyRead(db, p.rowFn)
+		if err := p.executeEmptyRowRead(db, cfg); err != nil {
+			db.AddError(err)
+		}
 		return
 	}
 	if len(tables) <= 1 {
@@ -471,12 +473,54 @@ func (p *Plugin) row(db *gorm.DB) {
 	}
 }
 
-// executeEmptyRead 使用恒为空的结果集完成 Query 或 Row 回调，保持 Find、Scan、Rows 的空结果语义。
+// executeEmptyRead 使用恒为空的结果集完成 Query 或 Row 回调，保持 Find、Scan、Row 的空结果语义。
 func (p *Plugin) executeEmptyRead(db *gorm.DB, execute func(*gorm.DB)) {
 	db.Statement.SQL.Reset()
 	db.Statement.SQL.WriteString("SELECT 1 AS gorm_sharding_empty FROM DUAL WHERE 1 = 0")
 	db.Statement.Vars = nil
 	execute(db)
+}
+
+// executeEmptyRowRead 在矛盾范围的 Rows 调用中保留原查询列结构。
+func (p *Plugin) executeEmptyRowRead(db *gorm.DB, cfg ShardingConfig) error {
+	value, ok := db.Get("rows")
+	isRows, _ := value.(bool)
+	if !ok || !isRows {
+		// Row() 只需要返回 sql.ErrNoRows，不会暴露结果集列元数据，使用恒为空查询即可。
+		p.executeEmptyRead(db, p.rowFn)
+		return db.Error
+	}
+
+	// Rows() 会把 *sql.Rows 交给调用方，Columns() 必须与原始 SELECT 一致。
+	// 因此不能使用虚拟 SELECT，而要在一张确认存在的真实分表执行原 WHERE 条件。
+	tables, err := p.manager.existingTables(cfg)
+	if err != nil {
+		return fmt.Errorf("gorm_sharding: find existing shard for empty Rows: %w", err)
+	}
+	if len(tables) == 0 {
+		return fmt.Errorf("gorm_sharding: empty Rows requires an existing shard")
+	}
+
+	setStatementTable(db, tables[0])
+	p.rowFn(db)
+	if !isMissingTableError(db.Error) {
+		return db.Error
+	}
+
+	// 元数据查询与执行之间表可能被外部删除。清理缓存后只重试一次，仍不存在则明确报错。
+	retryTables := p.manager.existingAfterMissing(cfg, tables)
+	if len(retryTables) == 0 {
+		return fmt.Errorf("gorm_sharding: empty Rows requires an existing shard")
+	}
+	db.Error = nil
+	db.Statement.SQL.Reset()
+	db.Statement.Vars = nil
+	// GORM 的 Row 回调在第一次执行后会删除 rows 标记；重试前必须恢复，
+	// 否则会错误地调用 QueryRowContext 并丢失 *sql.Rows 结果。
+	db.Statement.Settings.Store("rows", true)
+	setStatementTable(db, retryTables[0])
+	p.rowFn(db)
+	return db.Error
 }
 
 // setEmptyWriteResult 在矛盾时间范围下跳过 Update/Delete，并返回零影响行数。

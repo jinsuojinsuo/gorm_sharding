@@ -41,6 +41,8 @@ func (p *Plugin) executeRawWriteAcrossShards(db *gorm.DB) (bool, error) {
 			if shard.Error != nil {
 				if isMissingTableError(shard.Error) {
 					p.manager.invalidate(cfg, table)
+					// 缺失分表按空表处理，继续执行其他命中的真实分表。
+					continue
 				}
 				return 0, shard.Error
 			}

@@ -787,8 +787,8 @@ func TestRawUpdateAcrossShards(t *testing.T) {
 	}
 }
 
-// TestRawUpdateAcrossShardsRollsBackInternalTransaction 验证内部事务不会留下部分成功的数据。
-func TestRawUpdateAcrossShardsRollsBackInternalTransaction(t *testing.T) {
+// TestRawUpdateAcrossShardsSkipsMissingShard 验证 1146 缺失分表按空表跳过，不影响其他分表写入。
+func TestRawUpdateAcrossShardsSkipsMissingShard(t *testing.T) {
 	prefix := requirementUser{}.TableName()
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
 	defer cleanup()
@@ -807,16 +807,16 @@ func TestRawUpdateAcrossShardsRollsBackInternalTransaction(t *testing.T) {
 	}
 
 	result := db.Exec("UPDATE gs_req_user SET score = ? WHERE created_at BETWEEN ? AND ?", 9, day1, day2)
-	if result.Error == nil {
-		t.Fatal("raw update with missing shard returned nil error")
+	if result.Error != nil {
+		t.Fatalf("raw update with missing shard: %v", result.Error)
 	}
 	remainingTable := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day2)
 	var score int
 	if err := rawDB.Table(remainingTable).Select("score").Where("name = ?", "second").Scan(&score).Error; err != nil {
-		t.Fatalf("read row after rollback: %v", err)
+		t.Fatalf("read row after missing shard: %v", err)
 	}
-	if score != 2 {
-		t.Fatalf("score after rollback = %d, want 2", score)
+	if score != 9 {
+		t.Fatalf("score after missing shard = %d, want 9", score)
 	}
 }
 

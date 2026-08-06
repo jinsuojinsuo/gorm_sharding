@@ -211,16 +211,18 @@ func (p *Plugin) create(db *gorm.DB) {
 
 	rows, err := executeMultiShardWrite(db, func(writeDB *gorm.DB) (int64, error) {
 		var rows int64
-		for table, values := range groups {
+		for table, group := range groups {
 			// 批量数据可能分散到多张表，必须拆成多次 Create，并累加影响行数。
 			// skipKey 防止这些内部 Create 再次进入分表回调造成递归。
-			res, err := p.createShardValues(writeDB, cfg, table, values.Interface())
+			res, err := p.createShardValues(writeDB, cfg, table, group.values.Interface())
 			if err != nil {
 				return 0, err
 			}
 			if err := res.Error; err != nil {
 				return 0, err
 			}
+			// 分组时 []T 会被拆到临时切片中；插入成功后回写 GORM 生成的主键等字段。
+			group.copyGeneratedValues()
 			rows += res.RowsAffected
 		}
 		return rows, nil

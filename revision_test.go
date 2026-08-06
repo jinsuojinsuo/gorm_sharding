@@ -1,6 +1,7 @@
 package gorm_sharding
 
 import (
+	"errors"
 	"math"
 	"reflect"
 	"strings"
@@ -12,6 +13,20 @@ import (
 	"gorm.io/gorm/clause"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// TestGroupCreateValuesKeepsGormInvalidValue 验证非指针结构体 Create 保持 GORM 原生 ErrInvalidValue 行为。
+func TestGroupCreateValuesKeepsGormInvalidValue(t *testing.T) {
+	value := requirementUser{CreatedAt: time.Now()}
+	db := &gorm.DB{Statement: &gorm.Statement{
+		Dest:         value,
+		ReflectValue: reflect.ValueOf(value),
+	}}
+
+	_, err := New().groupCreateValues(db, ShardingConfig{ShardingKey: "created_at", Strategy: DayStrategy})
+	if !errors.Is(err, gorm.ErrInvalidValue) {
+		t.Fatalf("groupCreateValues error = %v, want %v", err, gorm.ErrInvalidValue)
+	}
+}
 
 // revisionDistinctUser 是跨分表 DISTINCT 验收测试使用的模型。
 type revisionDistinctUser struct {

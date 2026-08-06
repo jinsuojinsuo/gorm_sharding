@@ -96,6 +96,11 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 	if err := db.Create(&users).Error; err != nil {
 		t.Fatalf("batch create split across shards failed: %v", err)
 	}
+	for index, user := range users {
+		if user.ID == 0 {
+			t.Fatalf("batch create user %d ID was not filled", index)
+		}
+	}
 
 	cfg := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
 	if tableExists(t, rawDB, prefix) {

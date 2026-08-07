@@ -28,6 +28,21 @@ func (requirementUser) TableName() string {
 	return "gs_req_user"
 }
 
+// requirementSoftDeleteUser 是跨分表 Unscoped 语义测试使用的软删除模型。
+type requirementSoftDeleteUser struct {
+	ID        uint64         `gorm:"column:id;primaryKey;autoIncrement"`
+	Name      string         `gorm:"column:name;type:varchar(64);not null;default:'';index"`
+	Score     int            `gorm:"column:score;not null;default:0"`
+	CreatedAt time.Time      `gorm:"column:created_at;type:datetime;not null;index"`
+	UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime;not null"`
+	DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;index"`
+}
+
+// TableName 返回软删除测试模型的逻辑表名。
+func (requirementSoftDeleteUser) TableName() string {
+	return "gs_req_soft_delete_user"
+}
+
 // requirementUserV1 模拟历史表创建时的旧结构。
 type requirementUserV1 struct {
 	ID        uint64    `gorm:"column:id;primaryKey;autoIncrement"`
@@ -223,6 +238,54 @@ func TestRequirementCreateInBatchesAcrossShards(t *testing.T) {
 		table := cfg.tableName(tt.at)
 		if got := countRows(t, rawDB, table, "name LIKE 'batch_%'"); got != tt.want {
 			t.Fatalf("rows in %s = %d, want %d", table, got, tt.want)
+		}
+	}
+}
+
+// TestRequirementUnscopedAcrossShards 验证跨分表 Unscoped 查询、更新和物理删除保持 GORM 语义。
+func TestRequirementUnscopedAcrossShards(t *testing.T) {
+	prefix := requirementSoftDeleteUser{}.TableName()
+	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementSoftDeleteUser{})
+	defer cleanup()
+
+	first := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	second := first.AddDate(0, 0, 1)
+	if err := db.Create(&[]requirementSoftDeleteUser{
+		{Name: "soft_first", CreatedAt: first, UpdatedAt: first},
+		{Name: "soft_second", CreatedAt: second, UpdatedAt: second},
+	}).Error; err != nil {
+		t.Fatalf("create soft-delete rows: %v", err)
+	}
+
+	if result := db.Where("created_at BETWEEN ? AND ?", first, second).Delete(&requirementSoftDeleteUser{}); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("soft delete = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+
+	var users []requirementSoftDeleteUser
+	if err := db.Unscoped().Where("created_at BETWEEN ? AND ?", first, second).Order("created_at ASC").Find(&users).Error; err != nil {
+		t.Fatalf("unscoped find: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("unscoped find rows = %d, want 2", len(users))
+	}
+
+	if result := db.Unscoped().Model(&requirementSoftDeleteUser{}).Where("created_at BETWEEN ? AND ?", first, second).Updates(map[string]interface{}{"score": 99}); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("unscoped update = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+	for _, at := range []time.Time{first, second} {
+		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
+		if got := countRows(t, rawDB, table, "score = 99"); got != 1 {
+			t.Fatalf("unscoped update rows in %s = %d, want 1", table, got)
+		}
+	}
+
+	if result := db.Unscoped().Where("created_at BETWEEN ? AND ?", first, second).Delete(&requirementSoftDeleteUser{}); result.Error != nil || result.RowsAffected != 2 {
+		t.Fatalf("unscoped delete = rows:%d err:%v", result.RowsAffected, result.Error)
+	}
+	for _, at := range []time.Time{first, second} {
+		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
+		if got := countRows(t, rawDB, table, "1 = 1"); got != 0 {
+			t.Fatalf("unscoped delete rows in %s = %d, want 0", table, got)
 		}
 	}
 }

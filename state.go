@@ -6,6 +6,9 @@ import "gorm.io/gorm"
 func copyQueryState(dst, src *gorm.DB) {
 	// 跨分表执行时新建 Session，需要把用户链式调用积累的查询状态复制过去。
 	dst.Statement.Model = src.Statement.Model
+	// Unscoped 是 Statement 级状态；跨分表新建 Session 后必须保留，
+	// 否则软删除模型会错误追加 deleted_at IS NULL，Unscoped Delete 也会退化为软删除。
+	dst.Statement.Unscoped = src.Statement.Unscoped
 	dst.Statement.Clauses = src.Statement.Clauses
 	dst.Statement.Selects = src.Statement.Selects
 	dst.Statement.Omits = src.Statement.Omits

@@ -177,6 +177,24 @@ func TestRegisterRejectsAfterInitialize(t *testing.T) {
 	}
 }
 
+// TestAutoMigrateRequiresInitialize 验证未执行 db.Use 前调用插件迁移会返回错误，而不是解引用空表管理器。
+func TestAutoMigrateRequiresInitialize(t *testing.T) {
+	plugin := New()
+	if err := plugin.Register(requirementUser{}, ShardingConfig{
+		ShardingKey:   "created_at",
+		Strategy:      DayStrategy,
+		MaxScanTables: 1,
+		AutoMigrate:   true,
+	}); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+
+	err := plugin.AutoMigrate(nil, &requirementUser{})
+	if err == nil || err.Error() != "gorm_sharding: plugin must be initialized before AutoMigrate" {
+		t.Fatalf("AutoMigrate before initialize error = %v", err)
+	}
+}
+
 // TestTableNameLikePatternEscapesWildcards 防止逻辑表名前缀中的 LIKE 通配符匹配到其他业务表。
 func TestTableNameLikePatternEscapesWildcards(t *testing.T) {
 	if got, want := tableNameLikePattern("user_log%v"), "user\\_log\\%v\\_%"; got != want {

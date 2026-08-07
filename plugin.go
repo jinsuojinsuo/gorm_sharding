@@ -131,6 +131,13 @@ func (p *Plugin) resolveTablePrefixes(db *gorm.DB) error {
 
 // AutoMigrate 迁移已注册模型最近 MaxScanTables 张历史分表，不创建逻辑模板表。
 func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
+	p.initMu.Lock()
+	initialized := p.initialized
+	p.initMu.Unlock()
+	if !initialized || p.manager == nil {
+		return fmt.Errorf("gorm_sharding: plugin must be initialized before AutoMigrate")
+	}
+
 	for _, model := range models {
 		cfg, ok := p.configs[modelKey(model)]
 		if !ok || !cfg.AutoMigrate {

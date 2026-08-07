@@ -356,11 +356,11 @@ Age int
 执行：
 
 ```go
-db.AutoMigrate(&User{})
+plugin.AutoMigrate(db, &User{})
 ```
 
 
-插件自动：
+`plugin.AutoMigrate` 不接管 `db.AutoMigrate`，只迁移已注册且 `AutoMigrate` 配置为 `true` 的模型。插件自动：
 
 ```
 扫描最近 MaxScanTables 张分表
@@ -1014,7 +1014,7 @@ utils/
 
 ## AutoMigrate
 
-- 新字段同步所有历史分表
+- 新字段同步最近 `MaxScanTables` 张已存在历史分表
 - 新表自动拥有最新结构
 
 
@@ -1028,7 +1028,6 @@ utils/
 - Hash分表
 - 多字段分片
 - Join分表
-- 聚合查询
 - 热冷数据迁移
 - 自动清理历史表
 

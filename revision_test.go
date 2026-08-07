@@ -195,6 +195,49 @@ func TestAutoMigrateRequiresInitialize(t *testing.T) {
 	}
 }
 
+// TestCopyQueryStateClonesMutableState 验证跨分表内部查询不会与调用方共享 Clauses 或 Settings。
+func TestCopyQueryStateClonesMutableState(t *testing.T) {
+	src := &gorm.DB{Statement: &gorm.Statement{Clauses: map[string]clause.Clause{
+		"WHERE": {Expression: clause.Where{}},
+	}}}
+	src.Statement.Settings.Store("trace_id", "outer")
+	dst := &gorm.DB{Statement: &gorm.Statement{Clauses: map[string]clause.Clause{}}}
+
+	copyQueryState(dst, src)
+	dst.Statement.Clauses["LIMIT"] = clause.Clause{Expression: clause.Limit{}}
+	dst.Statement.Settings.Store("gorm_sharding:skip", true)
+
+	if _, ok := src.Statement.Clauses["LIMIT"]; ok {
+		t.Fatal("copyQueryState shared Clauses with source statement")
+	}
+	if _, ok := src.Statement.Settings.Load("gorm_sharding:skip"); ok {
+		t.Fatal("copyQueryState shared Settings with source statement")
+	}
+	if value, ok := dst.Statement.Settings.Load("trace_id"); !ok || value != "outer" {
+		t.Fatalf("copyQueryState trace_id = %v, %v; want outer, true", value, ok)
+	}
+}
+
+// TestCopyCreateStateClonesMutableState 验证跨分表 Create 内部 Session 不会与调用方共享状态。
+func TestCopyCreateStateClonesMutableState(t *testing.T) {
+	src := &gorm.DB{Statement: &gorm.Statement{Clauses: map[string]clause.Clause{
+		"ON CONFLICT": {Expression: clause.OnConflict{DoNothing: true}},
+	}}}
+	src.Statement.Settings.Store("trace_id", "outer")
+	dst := &gorm.DB{Statement: &gorm.Statement{Clauses: map[string]clause.Clause{}}}
+
+	copyCreateState(dst, src)
+	dst.Statement.Clauses["RETURNING"] = clause.Clause{}
+	dst.Statement.Settings.Store("gorm_sharding:skip", true)
+
+	if _, ok := src.Statement.Clauses["RETURNING"]; ok {
+		t.Fatal("copyCreateState shared Clauses with source statement")
+	}
+	if _, ok := src.Statement.Settings.Load("gorm_sharding:skip"); ok {
+		t.Fatal("copyCreateState shared Settings with source statement")
+	}
+}
+
 // TestTableNameLikePatternEscapesWildcards 防止逻辑表名前缀中的 LIKE 通配符匹配到其他业务表。
 func TestTableNameLikePatternEscapesWildcards(t *testing.T) {
 	if got, want := tableNameLikePattern("user_log%v"), "user\\_log\\%v\\_%"; got != want {

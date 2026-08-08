@@ -1,6 +1,7 @@
 package gorm_sharding
 
 import (
+	"fmt"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -36,14 +37,48 @@ func timeRangeFromStatement(db *gorm.DB, key string) (time.Time, time.Time, bool
 }
 
 // tablesFromExprs 从 where 表达式中提取分表路由目标，优先精确时间，其次时间范围。
-func tablesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) ([]string, bool) {
-	if values, ok := timeValuesFromExprs(exprs, key); ok {
-		return tablesForTimes(cfg, values), true
+func tablesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) ([]string, bool, error) {
+	if bounds, ok, err := likeRangeBoundsFromExprs(exprs, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
+		}
+		return tablesForRangeBounds(cfg, bounds), true, nil
 	}
-	if bounds, ok := timeRangeBoundsFromExprs(exprs, key); ok {
-		return tablesForRangeBounds(cfg, bounds), true
+	if values, ok, err := timeValuesFromExprs(exprs, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
+		}
+		return tablesForTimes(cfg, values), true, nil
 	}
-	return nil, false
+	if bounds, ok, err := timeRangeBoundsFromExprs(exprs, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
+		}
+		return tablesForRangeBounds(cfg, bounds), true, nil
+	}
+	if exprsReferenceColumn(exprs, key) {
+		return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+	}
+	return nil, false, nil
+}
+
+// likeRangeBoundsFromExprs 识别 created_at LIKE ? 的连续日期前缀并转换为半开时间范围。
+func likeRangeBoundsFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
+	for _, expression := range exprs {
+		expr, ok := expression.(clause.Expr)
+		if !ok {
+			continue
+		}
+		parsed, ok := parseConditionSQL(expr.SQL)
+		if !ok {
+			continue
+		}
+		bounds, matched, err := likeRangeBoundsFromVitessExpr(parsed, expr.Vars, cfg, key)
+		if err != nil || matched {
+			return bounds, matched, err
+		}
+	}
+	return timeRangeBounds{}, false, nil
 }
 
 // timeFromReflect 从模型值里读取分表字段时间。
@@ -84,11 +119,12 @@ func timeFromReflect(v reflect.Value, s *schema.Schema, key string) (time.Time, 
 
 // timeFromExprs 从 GORM where 表达式中提取精确时间条件。
 func timeFromExprs(exprs []clause.Expression, key string) (time.Time, bool) {
+	cfg := ShardingConfig{Location: time.Local}
 	for _, expr := range exprs {
 		switch e := expr.(type) {
 		case clause.Expr:
 			// 支持 Where("created_at = ?", t) 以及 Where("created_at = ? AND name = ?", t, name)。
-			if values, ok := timeValuesFromSQLExpr(e.SQL, e.Vars, key); ok && len(values) > 0 {
+			if values, ok, err := timeValuesFromSQLExpr(e.SQL, e.Vars, cfg, key); err == nil && ok && len(values) > 0 {
 				return values[0], true
 			}
 		case clause.Eq:
@@ -105,56 +141,87 @@ func timeFromExprs(exprs []clause.Expression, key string) (time.Time, bool) {
 }
 
 // timeValuesFromExprs 从 GORM where 表达式中提取精确时间值，支持 Eq、IN 和 OR 等值条件。
-func timeValuesFromExprs(exprs []clause.Expression, key string) ([]time.Time, bool) {
+func timeValuesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
 	out := make([]time.Time, 0)
-	for _, expr := range exprs {
+	for index, expr := range exprs {
 		switch e := expr.(type) {
 		case clause.Expr:
-			if values, ok := timeValuesFromSQLExpr(e.SQL, e.Vars, key); ok {
+			values, ok, err := timeValuesFromSQLExpr(e.SQL, e.Vars, cfg, key)
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
 				out = append(out, values...)
 			}
 		case clause.Eq:
 			if columnMatches(e.Column, key) {
-				if values, ok := asTimes(e.Value); ok {
-					out = append(out, values...)
+				value, err := normalizeShardingClauseValue(e.Value, cfg.Location)
+				if err != nil {
+					return nil, false, err
 				}
+				e.Value = value
+				exprs[index] = e
+				out = append(out, value)
 			}
 		case clause.IN:
 			if columnMatches(e.Column, key) {
-				if values, ok := asTimes(e.Values); ok {
-					out = append(out, values...)
+				values, normalized, err := normalizeShardingClauseValues(e.Values, cfg.Location)
+				if err != nil {
+					return nil, false, err
 				}
+				normalizedValues, ok := normalized.([]interface{})
+				if !ok {
+					return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+				}
+				e.Values = normalizedValues
+				exprs[index] = e
+				out = append(out, values...)
 			}
 		case clause.AndConditions:
-			if values, ok := timeValuesFromExprs(e.Exprs, key); ok {
+			values, ok, err := timeValuesFromExprs(e.Exprs, cfg, key)
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
+				e.Exprs = e.Exprs
+				exprs[index] = e
 				out = append(out, values...)
 			}
 		case clause.OrConditions:
-			values, ok := timeValuesFromExprs(e.Exprs, key)
-			if !ok {
-				return nil, false
+			values, ok, err := timeValuesFromExprs(e.Exprs, cfg, key)
+			if err != nil || !ok {
+				return nil, false, err
 			}
+			e.Exprs = e.Exprs
+			exprs[index] = e
 			out = append(out, values...)
 		}
 	}
 	if len(out) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
-	return out, true
+	return out, true, nil
 }
 
 // timeValuesFromSQLExpr 使用 Vitess AST 找出分表字段的等值或 IN 条件。
-func timeValuesFromSQLExpr(sql string, vars []interface{}, key string) ([]time.Time, bool) {
+func timeValuesFromSQLExpr(sql string, vars []interface{}, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
 	expr, ok := parseConditionSQL(sql)
 	if !ok {
-		return nil, false
+		if sqlMentionsColumn(sql, key) {
+			return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+		}
+		return nil, false, nil
 	}
-	return timeValuesFromVitessExpr(expr, vars, key)
+	return timeValuesFromVitessExpr(expr, vars, cfg, key)
 }
 
 // timeRangeFromExprs 从 GORM where 表达式中提取时间范围条件。
 func timeRangeFromExprs(exprs []clause.Expression, key string) (time.Time, time.Time, bool) {
-	bounds, ok := timeRangeBoundsFromExprs(exprs, key)
+	cfg := ShardingConfig{Location: time.Local}
+	bounds, ok, err := timeRangeBoundsFromExprs(exprs, cfg, key)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
 	if !ok {
 		return time.Time{}, time.Time{}, false
 	}
@@ -169,24 +236,31 @@ type timeRangeBounds struct {
 }
 
 // timeRangeBoundsFromExprs 提取时间范围及上下界是否排除，供分表边界计算使用。
-func timeRangeBoundsFromExprs(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
-	bounds, found := collectRangeBounds(exprs, key)
-	if !found || bounds.start.IsZero() || bounds.end.IsZero() {
-		return timeRangeBounds{}, false
+func timeRangeBoundsFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
+	bounds, found, err := collectRangeBounds(exprs, cfg, key)
+	if err != nil {
+		return timeRangeBounds{}, false, err
 	}
-	return bounds, true
+	if !found || bounds.start.IsZero() || bounds.end.IsZero() {
+		return timeRangeBounds{}, false, nil
+	}
+	return bounds, true, nil
 }
 
 // collectRangeBounds 收集表达式列表中的范围片段，并按 AND 语义取交集。
 // 返回值允许只包含上界或下界，供调用方继续与其他 Where 表达式合并。
-func collectRangeBounds(exprs []clause.Expression, key string) (timeRangeBounds, bool) {
+func collectRangeBounds(exprs []clause.Expression, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
 	var bounds timeRangeBounds
 	found := false
-	for _, expr := range exprs {
-		parsed, ok := rangeBoundsFromExpression(expr, key)
+	for index, expr := range exprs {
+		parsed, updated, ok, err := rangeBoundsFromExpression(expr, cfg, key)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
 		if !ok {
 			continue
 		}
+		exprs[index] = updated
 		if !found {
 			bounds = parsed
 			found = true
@@ -194,14 +268,15 @@ func collectRangeBounds(exprs []clause.Expression, key string) (timeRangeBounds,
 		}
 		bounds = intersectRangeBounds(bounds, parsed)
 	}
-	return bounds, found
+	return bounds, found, nil
 }
 
 // rangeBoundsFromExpression 读取单个 GORM 条件中的完整或部分范围边界。
-func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBounds, bool) {
+func rangeBoundsFromExpression(expr clause.Expression, cfg ShardingConfig, key string) (timeRangeBounds, clause.Expression, bool, error) {
 	switch e := expr.(type) {
 	case clause.Expr:
-		return timeRangeBoundsFromSQLExpr(e.SQL, e.Vars, key)
+		bounds, ok, err := timeRangeBoundsFromSQLExpr(e.SQL, e.Vars, cfg, key)
+		return bounds, e, ok, err
 	case clause.Gt, clause.Gte:
 		var column interface{}
 		var value interface{}
@@ -213,8 +288,17 @@ func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBou
 			column, value = condition.Column, condition.Value
 		}
 		if columnMatches(column, key) {
-			if start, ok := asTime(value); ok {
-				return timeRangeBounds{start: start, startExclusive: exclusive}, true
+			start, err := normalizeShardingClauseValue(value, cfg.Location)
+			if err != nil {
+				return timeRangeBounds{}, expr, false, err
+			}
+			switch condition := e.(type) {
+			case clause.Gt:
+				condition.Value = start
+				return timeRangeBounds{start: start, startExclusive: exclusive}, condition, true, nil
+			case clause.Gte:
+				condition.Value = start
+				return timeRangeBounds{start: start, startExclusive: exclusive}, condition, true, nil
 			}
 		}
 	case clause.Lt, clause.Lte:
@@ -228,14 +312,24 @@ func rangeBoundsFromExpression(expr clause.Expression, key string) (timeRangeBou
 			column, value = condition.Column, condition.Value
 		}
 		if columnMatches(column, key) {
-			if end, ok := asTime(value); ok {
-				return timeRangeBounds{end: end, endExclusive: exclusive}, true
+			end, err := normalizeShardingClauseValue(value, cfg.Location)
+			if err != nil {
+				return timeRangeBounds{}, expr, false, err
+			}
+			switch condition := e.(type) {
+			case clause.Lt:
+				condition.Value = end
+				return timeRangeBounds{end: end, endExclusive: exclusive}, condition, true, nil
+			case clause.Lte:
+				condition.Value = end
+				return timeRangeBounds{end: end, endExclusive: exclusive}, condition, true, nil
 			}
 		}
 	case clause.AndConditions:
-		return collectRangeBounds(e.Exprs, key)
+		bounds, ok, err := collectRangeBounds(e.Exprs, cfg, key)
+		return bounds, e, ok, err
 	}
-	return timeRangeBounds{}, false
+	return timeRangeBounds{}, expr, false, nil
 }
 
 // intersectRangeBounds 合并两个 AND 范围条件：下界取较晚值，上界取较早值，并保留开闭边界。
@@ -260,7 +354,11 @@ func intersectRangeBounds(left, right timeRangeBounds) timeRangeBounds {
 
 // timeRangeFromSQLExpr 从字符串 where 条件中提取 BETWEEN 或上下界时间条件。
 func timeRangeFromSQLExpr(sql string, vars []interface{}, key string) (time.Time, time.Time, bool) {
-	bounds, ok := timeRangeBoundsFromSQLExpr(sql, vars, key)
+	cfg := ShardingConfig{Location: time.Local}
+	bounds, ok, err := timeRangeBoundsFromSQLExpr(sql, vars, cfg, key)
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
 	if !ok {
 		return time.Time{}, time.Time{}, false
 	}
@@ -268,12 +366,15 @@ func timeRangeFromSQLExpr(sql string, vars []interface{}, key string) (time.Time
 }
 
 // timeRangeBoundsFromSQLExpr 使用 Vitess AST 从字符串条件中提取时间范围。
-func timeRangeBoundsFromSQLExpr(sql string, vars []interface{}, key string) (timeRangeBounds, bool) {
+func timeRangeBoundsFromSQLExpr(sql string, vars []interface{}, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
 	expr, ok := parseConditionSQL(sql)
 	if !ok {
-		return timeRangeBounds{}, false
+		if sqlMentionsColumn(sql, key) {
+			return timeRangeBounds{}, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+		}
+		return timeRangeBounds{}, false, nil
 	}
-	return timeRangeBoundsFromVitessExpr(expr, vars, key)
+	return timeRangeBoundsFromVitessExpr(expr, vars, cfg, key)
 }
 
 // parseConditionSQL 把 GORM 的字符串条件包装为 SELECT，再交给 Vitess 解析。
@@ -294,7 +395,7 @@ func parseConditionSQL(sql string) (sqlparser.Expr, bool) {
 
 // rawStatementTables 从 Raw SQL 的 WHERE AST 中计算精确目标分表。
 // routed 为 false 表示条件不含可识别的分表字段，调用方可按默认最近表策略处理。
-func rawStatementTables(stmt sqlparser.Statement, vars []interface{}, cfg ShardingConfig, key string) ([]string, bool) {
+func rawStatementTables(stmt sqlparser.Statement, vars []interface{}, cfg ShardingConfig, key string) ([]string, bool, error) {
 	var where *sqlparser.Where
 	switch s := stmt.(type) {
 	case *sqlparser.Select:
@@ -304,68 +405,104 @@ func rawStatementTables(stmt sqlparser.Statement, vars []interface{}, cfg Shardi
 	case *sqlparser.Delete:
 		where = s.Where
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 	if where == nil {
-		return nil, false
+		return nil, false, nil
 	}
-	if values, ok := timeValuesFromVitessExpr(where.Expr, vars, key); ok {
-		return tablesForTimes(cfg, values), true
-	}
-	if bounds, ok := timeRangeBoundsFromVitessExpr(where.Expr, vars, key); ok {
-		if bounds.start.IsZero() || bounds.end.IsZero() {
-			return nil, false
+	if bounds, ok, err := likeRangeBoundsFromVitessExpr(where.Expr, vars, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
 		}
-		return tablesForRangeBounds(cfg, bounds), true
+		return tablesForRangeBounds(cfg, bounds), true, nil
 	}
-	return nil, false
+	if values, ok, err := timeValuesFromVitessExpr(where.Expr, vars, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
+		}
+		return tablesForTimes(cfg, values), true, nil
+	}
+	if bounds, ok, err := timeRangeBoundsFromVitessExpr(where.Expr, vars, cfg, key); err != nil || ok {
+		if err != nil {
+			return nil, false, err
+		}
+		if bounds.start.IsZero() || bounds.end.IsZero() {
+			return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+		}
+		return tablesForRangeBounds(cfg, bounds), true, nil
+	}
+	if vitessExprReferencesColumn(where.Expr, key) {
+		return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+	}
+	return nil, false, nil
 }
 
 // timeValuesFromVitessExpr 提取 AND/OR 组合中的精确分表时间；OR 的每一支都必须可精确路由。
-func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key string) ([]time.Time, bool) {
+func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
 	switch e := expr.(type) {
 	case *sqlparser.AndExpr:
-		left, leftOK := timeValuesFromVitessExpr(e.Left, vars, key)
-		right, rightOK := timeValuesFromVitessExpr(e.Right, vars, key)
+		left, leftOK, err := timeValuesFromVitessExpr(e.Left, vars, cfg, key)
+		if err != nil {
+			return nil, false, err
+		}
+		right, rightOK, err := timeValuesFromVitessExpr(e.Right, vars, cfg, key)
+		if err != nil {
+			return nil, false, err
+		}
 		if !leftOK && !rightOK {
-			return nil, false
+			return nil, false, nil
 		}
-		return append(left, right...), true
+		return append(left, right...), true, nil
 	case *sqlparser.OrExpr:
-		left, leftOK := timeValuesFromVitessExpr(e.Left, vars, key)
-		right, rightOK := timeValuesFromVitessExpr(e.Right, vars, key)
-		if !leftOK || !rightOK {
-			return nil, false
+		left, leftOK, err := timeValuesFromVitessExpr(e.Left, vars, cfg, key)
+		if err != nil {
+			return nil, false, err
 		}
-		return append(left, right...), true
+		right, rightOK, err := timeValuesFromVitessExpr(e.Right, vars, cfg, key)
+		if err != nil {
+			return nil, false, err
+		}
+		if !leftOK || !rightOK {
+			if vitessExprReferencesColumn(expr, key) {
+				return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+			}
+			return nil, false, nil
+		}
+		return append(left, right...), true, nil
 	case *sqlparser.ComparisonExpr:
 		if !vitessColumnMatches(e.Left, key) {
-			return nil, false
+			return nil, false, nil
 		}
 		switch e.Operator {
 		case sqlparser.EqualOp:
-			return timeValuesFromVitessValue(e.Right, vars)
+			return timeValuesFromVitessValue(e.Right, vars, cfg.Location)
 		case sqlparser.InOp:
-			return timeValuesFromVitessValue(e.Right, vars)
+			return timeValuesFromVitessValue(e.Right, vars, cfg.Location)
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 // timeRangeBoundsFromVitessExpr 仅接受 AND 组合的范围条件，避免 OR 条件被错误缩窄。
-func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key string) (timeRangeBounds, bool) {
+func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
 	switch e := expr.(type) {
 	case *sqlparser.AndExpr:
-		left, leftOK := timeRangeBoundsFromVitessExpr(e.Left, vars, key)
-		right, rightOK := timeRangeBoundsFromVitessExpr(e.Right, vars, key)
+		left, leftOK, err := timeRangeBoundsFromVitessExpr(e.Left, vars, cfg, key)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
+		right, rightOK, err := timeRangeBoundsFromVitessExpr(e.Right, vars, cfg, key)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
 		if !leftOK && !rightOK {
-			return timeRangeBounds{}, false
+			return timeRangeBounds{}, false, nil
 		}
 		if !leftOK {
-			return right, true
+			return right, true, nil
 		}
 		if !rightOK {
-			return left, true
+			return left, true, nil
 		}
 		// AND 条件的下界取较晚值、上界取较早值，不能依赖条件书写顺序。
 		if !right.start.IsZero() && (left.start.IsZero() || right.start.After(left.start)) {
@@ -384,37 +521,40 @@ func timeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, key 
 				left.endExclusive = left.endExclusive || right.endExclusive
 			}
 		}
-		return left, true
+		return left, true, nil
 	case *sqlparser.BetweenExpr:
 		if !e.IsBetween || !vitessColumnMatches(e.Left, key) {
-			return timeRangeBounds{}, false
+			return timeRangeBounds{}, false, nil
 		}
-		start, startOK := timeFromVitessValue(e.From, vars)
-		end, endOK := timeFromVitessValue(e.To, vars)
-		if !startOK || !endOK {
-			return timeRangeBounds{}, false
+		start, err := timeFromVitessValue(e.From, vars, cfg.Location)
+		if err != nil {
+			return timeRangeBounds{}, false, err
 		}
-		return timeRangeBounds{start: start, end: end}, true
+		end, err := timeFromVitessValue(e.To, vars, cfg.Location)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
+		return timeRangeBounds{start: start, end: end}, true, nil
 	case *sqlparser.ComparisonExpr:
 		if !vitessColumnMatches(e.Left, key) {
-			return timeRangeBounds{}, false
+			return timeRangeBounds{}, false, nil
 		}
-		value, ok := timeFromVitessValue(e.Right, vars)
-		if !ok {
-			return timeRangeBounds{}, false
+		value, err := timeFromVitessValue(e.Right, vars, cfg.Location)
+		if err != nil {
+			return timeRangeBounds{}, false, err
 		}
 		switch e.Operator {
 		case sqlparser.GreaterThanOp:
-			return timeRangeBounds{start: value, startExclusive: true}, true
+			return timeRangeBounds{start: value, startExclusive: true}, true, nil
 		case sqlparser.GreaterEqualOp:
-			return timeRangeBounds{start: value}, true
+			return timeRangeBounds{start: value}, true, nil
 		case sqlparser.LessThanOp:
-			return timeRangeBounds{end: value, endExclusive: true}, true
+			return timeRangeBounds{end: value, endExclusive: true}, true, nil
 		case sqlparser.LessEqualOp:
-			return timeRangeBounds{end: value}, true
+			return timeRangeBounds{end: value}, true, nil
 		}
 	}
-	return timeRangeBounds{}, false
+	return timeRangeBounds{}, false, nil
 }
 
 // vitessColumnMatches 判断 Vitess AST 中的列是否等于分表字段。
@@ -423,42 +563,93 @@ func vitessColumnMatches(expr sqlparser.Expr, key string) bool {
 	return ok && normalizeColumnName(column.Name.String()) == normalizeColumnName(key)
 }
 
-// timeValuesFromVitessValue 从 AST 值表达式中读取一个或多个绑定时间参数。
-func timeValuesFromVitessValue(expr sqlparser.Expr, vars []interface{}) ([]time.Time, bool) {
-	if value, ok := timeFromVitessValue(expr, vars); ok {
-		return []time.Time{value}, true
+// likeRangeBoundsFromVitessExpr 提取分表字段 LIKE 连续日期前缀。
+func likeRangeBoundsFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		left, leftOK, err := likeRangeBoundsFromVitessExpr(e.Left, vars, cfg, key)
+		if err != nil || leftOK {
+			return left, leftOK, err
+		}
+		return likeRangeBoundsFromVitessExpr(e.Right, vars, cfg, key)
+	case *sqlparser.ComparisonExpr:
+		if !vitessColumnMatches(e.Left, key) {
+			return timeRangeBounds{}, false, nil
+		}
+		if e.Operator != sqlparser.LikeOp {
+			return timeRangeBounds{}, false, nil
+		}
+		pattern, err := stringFromVitessValue(e.Right, vars)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
+		start, end, err := parseShardingLikePrefix(pattern, cfg.Location)
+		if err != nil {
+			return timeRangeBounds{}, false, err
+		}
+		return timeRangeBounds{start: start, end: end, endExclusive: true}, true, nil
 	}
+	return timeRangeBounds{}, false, nil
+}
+
+// timeValuesFromVitessValue 从 AST 值表达式中读取一个或多个绑定时间参数。
+func timeValuesFromVitessValue(expr sqlparser.Expr, vars []interface{}, location *time.Location) ([]time.Time, bool, error) {
 	if argument, ok := expr.(*sqlparser.Argument); ok {
 		if index, ok := vitessArgumentIndex(argument, len(vars)); ok {
-			return asTimes(vars[index])
+			values, normalized, err := normalizeShardingClauseValues(vars[index], location)
+			if err != nil {
+				return nil, false, err
+			}
+			vars[index] = normalized
+			return values, true, nil
 		}
+		return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+	}
+	if value, err := timeFromVitessValue(expr, vars, location); err == nil {
+		return []time.Time{value}, true, nil
+	} else if !isUnsupportedVitessValue(expr) {
+		return nil, false, err
 	}
 	tuple, ok := expr.(sqlparser.ValTuple)
 	if !ok {
-		return nil, false
+		if isInlineLiteral(expr) {
+			return nil, false, fmt.Errorf("gorm_sharding: inline sharding time literal is not supported")
+		}
+		return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
 	}
 	out := make([]time.Time, 0, len(tuple))
 	for _, item := range tuple {
-		values, ok := timeValuesFromVitessValue(item, vars)
+		values, ok, err := timeValuesFromVitessValue(item, vars, location)
+		if err != nil {
+			return nil, false, err
+		}
 		if !ok {
-			return nil, false
+			return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
 		}
 		out = append(out, values...)
 	}
-	return out, len(out) > 0
+	return out, len(out) > 0, nil
 }
 
 // timeFromVitessValue 根据 Vitess 自动生成的 v1、v2 占位符读取 GORM 参数。
-func timeFromVitessValue(expr sqlparser.Expr, vars []interface{}) (time.Time, bool) {
+func timeFromVitessValue(expr sqlparser.Expr, vars []interface{}, location *time.Location) (time.Time, error) {
 	argument, ok := expr.(*sqlparser.Argument)
 	if !ok {
-		return time.Time{}, false
+		if isInlineLiteral(expr) {
+			return time.Time{}, fmt.Errorf("gorm_sharding: inline sharding time literal is not supported")
+		}
+		return time.Time{}, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
 	}
 	index, ok := vitessArgumentIndex(argument, len(vars))
 	if !ok {
-		return time.Time{}, false
+		return time.Time{}, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
 	}
-	return asTime(vars[index])
+	value, err := normalizeShardingClauseValue(vars[index], location)
+	if err != nil {
+		return time.Time{}, err
+	}
+	vars[index] = value
+	return value, nil
 }
 
 // vitessArgumentIndex 把 Vitess 自动生成的 v1、v2 占位符转换为 GORM 参数下标。
@@ -471,6 +662,101 @@ func vitessArgumentIndex(argument *sqlparser.Argument, length int) (int, bool) {
 		return 0, false
 	}
 	return index - 1, true
+}
+
+// normalizeShardingClauseValue 只用于已经确认属于 ShardingKey 的条件参数。
+func normalizeShardingClauseValue(value interface{}, location *time.Location) (time.Time, error) {
+	return parseShardingTime(value, effectiveShardingLocation(location))
+}
+
+// normalizeShardingClauseValues 处理 ShardingKey 的 IN 参数，支持单个切片或数组参数。
+func normalizeShardingClauseValues(value interface{}, location *time.Location) ([]time.Time, interface{}, error) {
+	if at, err := normalizeShardingClauseValue(value, location); err == nil {
+		return []time.Time{at}, at, nil
+	}
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() {
+		return nil, nil, fmt.Errorf("gorm_sharding: sharding time must be time.Time or supported string")
+	}
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return nil, nil, fmt.Errorf("gorm_sharding: sharding time must be time.Time or supported string")
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil, nil, fmt.Errorf("gorm_sharding: sharding time must be time.Time or supported string")
+	}
+	values := make([]time.Time, 0, rv.Len())
+	normalized := make([]interface{}, 0, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		at, err := normalizeShardingClauseValue(rv.Index(i).Interface(), location)
+		if err != nil {
+			return nil, nil, err
+		}
+		values = append(values, at)
+		normalized = append(normalized, at)
+	}
+	return values, normalized, nil
+}
+
+// stringFromVitessValue 读取 LIKE 的绑定字符串；内联 LIKE 字面量同样拒绝。
+func stringFromVitessValue(expr sqlparser.Expr, vars []interface{}) (string, error) {
+	argument, ok := expr.(*sqlparser.Argument)
+	if !ok {
+		if isInlineLiteral(expr) {
+			return "", fmt.Errorf("gorm_sharding: inline sharding time literal is not supported")
+		}
+		return "", fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+	}
+	index, ok := vitessArgumentIndex(argument, len(vars))
+	if !ok {
+		return "", fmt.Errorf("gorm_sharding: unsupported sharding time expression")
+	}
+	pattern, ok := vars[index].(string)
+	if !ok {
+		return "", fmt.Errorf("gorm_sharding: unsupported sharding time LIKE pattern")
+	}
+	return pattern, nil
+}
+
+func effectiveShardingLocation(location *time.Location) *time.Location {
+	if location == nil {
+		return time.Local
+	}
+	return location
+}
+
+func isInlineLiteral(expr sqlparser.Expr) bool {
+	_, ok := expr.(*sqlparser.Literal)
+	return ok
+}
+
+func isUnsupportedVitessValue(expr sqlparser.Expr) bool {
+	if _, ok := expr.(sqlparser.ValTuple); ok {
+		return true
+	}
+	return isInlineLiteral(expr)
+}
+
+func vitessExprReferencesColumn(expr sqlparser.Expr, key string) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		column, ok := node.(*sqlparser.ColName)
+		if ok && normalizeColumnName(column.Name.String()) == normalizeColumnName(key) {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
+func sqlMentionsColumn(sql, key string) bool {
+	if sqlExprReferencesColumn(sql, key) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(sql), strings.ToLower(key))
 }
 
 // columnMatches 判断 GORM 条件里的列名是否等于分表字段。

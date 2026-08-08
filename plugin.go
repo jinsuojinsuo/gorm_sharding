@@ -759,7 +759,12 @@ func (p *Plugin) routeReadTables(db *gorm.DB, cfg ShardingConfig) []string {
 	// Find 的结果对象可能预先带有字段值，但 GORM 不会把这些值变成 WHERE 条件。
 	// 读取路由必须与 GORM 实际生成的筛选条件一致，避免错误地漏扫分表。
 	if where, ok := db.Statement.Clauses["WHERE"].Expression.(clause.Where); ok {
-		if tables, ok := tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey); ok {
+		tables, ok, err := tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey)
+		if err != nil {
+			db.AddError(err)
+			return nil
+		}
+		if ok {
 			return tables
 		}
 	}

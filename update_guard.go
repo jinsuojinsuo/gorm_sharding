@@ -138,8 +138,8 @@ func hasWriteShardingRoute(db *gorm.DB, cfg ShardingConfig) bool {
 	if !ok {
 		return false
 	}
-	_, ok = tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey)
-	return ok
+	_, ok, err := tablesFromExprs(where.Exprs, cfg, cfg.ShardingKey)
+	return ok || err != nil
 }
 
 // statementPrimaryKey 返回当前模型主键的数据库列名。

@@ -131,7 +131,10 @@ func (p *Plugin) rawWriteTargets(db *gorm.DB, stmt sqlparser.Statement, vars []i
 	if update != nil && rawUpdateChangesShardingKey(update, cfg.ShardingKey) {
 		return ShardingConfig{}, nil, true, fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey)
 	}
-	targets, routed := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
+	targets, routed, err := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
+	if err != nil {
+		return ShardingConfig{}, nil, true, err
+	}
 	if !routed {
 		targets = p.manager.tables(db, cfg, time.Now())
 	}
@@ -274,7 +277,10 @@ func (p *Plugin) rewriteTableName(db *gorm.DB, table *sqlparser.TableName, stmt 
 	if update, ok := stmt.(*sqlparser.Update); ok && rawUpdateChangesShardingKey(update, cfg.ShardingKey) {
 		return false, fmt.Errorf("gorm_sharding: updating sharding key %s is not supported", cfg.ShardingKey)
 	}
-	targets, routed := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
+	targets, routed, err := rawStatementTables(stmt, vars, cfg, cfg.ShardingKey)
+	if err != nil {
+		return false, err
+	}
 	if routed && len(targets) != 1 {
 		return false, fmt.Errorf("gorm_sharding: raw SQL across shards is not supported")
 	}

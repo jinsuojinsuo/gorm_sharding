@@ -254,9 +254,9 @@ func TestRouteDoesNotMatchSimilarColumnName(t *testing.T) {
 	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 1}
 	at := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 
-	if _, ok := tablesFromExprs([]clause.Expression{
+	if _, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "other_created_at = ?", Vars: []interface{}{at}},
-	}, cfg, "created_at"); ok {
+	}, cfg, "created_at"); err != nil || ok {
 		t.Fatal("similar column name was treated as the sharding key")
 	}
 }
@@ -267,9 +267,12 @@ func TestHalfOpenRangeWithOneShardScansStartShard(t *testing.T) {
 	start := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 	end := start.Add(time.Hour)
 
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at >= ? AND created_at < ?", Vars: []interface{}{start, end}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("half-open range was not recognized")
 	}
@@ -286,10 +289,13 @@ func TestRangeRouteUsesIntersectionBounds(t *testing.T) {
 	day3 := day1.AddDate(0, 0, 2)
 	day4 := day1.AddDate(0, 0, 3)
 
-	tables, ok := tablesFromExprs([]clause.Expression{clause.Expr{
+	tables, ok, err := tablesFromExprs([]clause.Expression{clause.Expr{
 		SQL:  "created_at >= ? AND created_at >= ? AND created_at < ? AND created_at < ?",
 		Vars: []interface{}{day1, day2, day4, day3},
 	}}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("range intersection was not recognized")
 	}
@@ -304,10 +310,13 @@ func TestRangeRouteMergesSeparateWhereExpressions(t *testing.T) {
 	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, 2)
 
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at >= ?", Vars: []interface{}{start}},
 		clause.Expr{SQL: "created_at < ?", Vars: []interface{}{end}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("separate range expressions were not recognized")
 	}
@@ -334,7 +343,10 @@ func TestRangeRouteMergesChainedWhere(t *testing.T) {
 	if !ok {
 		t.Fatal("GORM did not create WHERE clause")
 	}
-	tables, ok := tablesFromExprs(where.Exprs, cfg, "created_at")
+	tables, ok, err := tablesFromExprs(where.Exprs, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("chained Where range was not recognized")
 	}
@@ -374,9 +386,12 @@ func TestReverseRangeRoutesNoTables(t *testing.T) {
 	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	start := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, -2)
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at >= ? AND created_at < ?", Vars: []interface{}{start, end}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("reverse range was not recognized")
 	}
@@ -390,9 +405,12 @@ func TestEqualHalfOpenRangeRoutesNoTables(t *testing.T) {
 	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	at := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
 
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at >= ? AND created_at < ?", Vars: []interface{}{at, at}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("equal half-open range was not recognized")
 	}
@@ -406,9 +424,12 @@ func TestEqualOpenStartRangeRoutesNoTables(t *testing.T) {
 	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	at := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at > ? AND created_at <= ?", Vars: []interface{}{at, at}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok {
 		t.Fatal("equal open-start range was not recognized")
 	}
@@ -622,7 +643,10 @@ func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
 		t.Fatalf("parse raw SQL: %v", err)
 	}
 
-	tables, routed := rawStatementTables(stmt, []interface{}{oldAt}, cfg, "created_at")
+	tables, routed, err := rawStatementTables(stmt, []interface{}{oldAt}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("rawStatementTables error = %v", err)
+	}
 	if !routed || !sameStrings(tables, []string{"user_20260802"}) {
 		t.Fatalf("tables = %v, routed = %v", tables, routed)
 	}
@@ -638,7 +662,10 @@ func TestRawStatementDetectsMultipleShards(t *testing.T) {
 		t.Fatalf("parse raw SQL: %v", err)
 	}
 
-	tables, routed := rawStatementTables(stmt, []interface{}{t1, t2}, cfg, "created_at")
+	tables, routed, err := rawStatementTables(stmt, []interface{}{t1, t2}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("rawStatementTables error = %v", err)
+	}
 	if !routed || !sameStrings(tables, []string{"user_20260802", "user_20260803"}) {
 		t.Fatalf("tables = %v, routed = %v", tables, routed)
 	}
@@ -669,9 +696,12 @@ func TestRouteParsesSliceArgumentIn(t *testing.T) {
 	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
 	t1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
 	t2 := t1.AddDate(0, 0, 1)
-	tables, ok := tablesFromExprs([]clause.Expression{
+	tables, ok, err := tablesFromExprs([]clause.Expression{
 		clause.Expr{SQL: "created_at IN ?", Vars: []interface{}{[]time.Time{t1, t2}}},
 	}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
 	if !ok || !sameStrings(tables, []string{"user_20260802", "user_20260803"}) {
 		t.Fatalf("tables = %v, routed = %v", tables, ok)
 	}

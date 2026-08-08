@@ -67,12 +67,91 @@ func TestRouteExtractsTablesFromCommonWhereForms(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := tablesFromExprs(tt.exprs, cfg, "created_at")
+			got, ok, err := tablesFromExprs(tt.exprs, cfg, "created_at")
+			if err != nil {
+				t.Fatalf("tablesFromExprs error = %v", err)
+			}
 			if !ok {
 				t.Fatalf("where expression was not recognized")
 			}
 			if !sameStrings(got, tt.want) {
 				t.Fatalf("tables = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRouteLikeDoesNotMatchSimilarColumnName 防止 other_created_at LIKE ? 被误识别为分表字段 LIKE。
+func TestRouteLikeDoesNotMatchSimilarColumnName(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+
+	if _, ok, err := tablesFromExprs([]clause.Expression{
+		clause.Expr{SQL: "other_created_at LIKE ?", Vars: []interface{}{"2026%"}},
+	}, cfg, "created_at"); err != nil || ok {
+		t.Fatalf("similar LIKE routed = %v, err = %v; want not routed", ok, err)
+	}
+}
+
+// TestRouteNormalizesOnlyShardingKeyTimeStrings 验证只有分表字段的时间字符串会按配置时区解释并回写参数。
+func TestRouteNormalizesOnlyShardingKeyTimeStrings(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      location,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	expr := clause.Expr{
+		SQL:  "created_at = ? AND updated_at = ?",
+		Vars: []interface{}{"2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"},
+	}
+
+	got, ok, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("where expression was not recognized")
+	}
+	if !sameStrings(got, []string{"user_20260804"}) {
+		t.Fatalf("tables = %v, want user_20260804", got)
+	}
+	normalized, ok := expr.Vars[0].(time.Time)
+	if !ok || normalized.Location() != location || normalized.Hour() != 8 {
+		t.Fatalf("created_at var = %#v, want time in UTC+8 at 08:00", expr.Vars[0])
+	}
+	if expr.Vars[1] != "2026-08-04T00:00:00Z" {
+		t.Fatalf("updated_at var changed to %#v", expr.Vars[1])
+	}
+}
+
+// TestRouteRejectsUnsupportedShardingTimeInputs 验证分表字段上的非法时间不会退化为最近周期扫描。
+func TestRouteRejectsUnsupportedShardingTimeInputs(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	cases := []struct {
+		name  string
+		exprs []clause.Expression
+	}{
+		{name: "bad string", exprs: []clause.Expression{clause.Expr{SQL: "created_at = ?", Vars: []interface{}{"2026.08.04"}}}},
+		{name: "inline literal", exprs: []clause.Expression{clause.Expr{SQL: "created_at = '2026-08-04'"}}},
+		{name: "bad like", exprs: []clause.Expression{clause.Expr{SQL: "created_at LIKE ?", Vars: []interface{}{"2026-0%"}}}},
+		{name: "unsupported expression", exprs: []clause.Expression{clause.Expr{SQL: "DATE(created_at) = ?", Vars: []interface{}{"2026-08-04"}}}},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := tablesFromExprs(tt.exprs, cfg, "created_at"); err == nil {
+				t.Fatal("tablesFromExprs returned nil error")
 			}
 		})
 	}

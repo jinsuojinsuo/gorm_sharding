@@ -32,7 +32,7 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 		if !value.CanAddr() {
 			return nil, gorm.ErrInvalidValue
 		}
-		t, ok := valueTime(value, db.Statement.Schema, cfg.ShardingKey)
+		t, ok := normalizeModelShardingTime(value, db.Statement.Schema, cfg)
 		if !ok {
 			return nil, fmt.Errorf("gorm_sharding: sharding key %s must be time.Time", cfg.ShardingKey)
 		}
@@ -52,7 +52,7 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 	groups := make(map[string]createValueGroup)
 	for i := 0; i < value.Len(); i++ {
 		elem := value.Index(i)
-		t, ok := valueTime(elem, db.Statement.Schema, cfg.ShardingKey)
+		t, ok := normalizeModelShardingTime(elem, db.Statement.Schema, cfg)
 		if !ok {
 			return nil, fmt.Errorf("gorm_sharding: sharding key %s must be time.Time", cfg.ShardingKey)
 		}
@@ -68,6 +68,38 @@ func (p *Plugin) groupCreateValues(db *gorm.DB, cfg ShardingConfig) (map[string]
 		groups[table] = group
 	}
 	return groups, nil
+}
+
+// normalizeModelShardingTime 将待插入实体的分表字段转换为固定分表时区，并返回转换后的值。
+func normalizeModelShardingTime(value reflect.Value, schema *schema.Schema, cfg ShardingConfig) (time.Time, bool) {
+	for value.Kind() == reflect.Ptr {
+		if value.IsNil() {
+			return time.Time{}, false
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return time.Time{}, false
+	}
+	fieldName := cfg.ShardingKey
+	if schema != nil {
+		if field := schema.LookUpField(cfg.ShardingKey); field != nil {
+			fieldName = field.Name
+		}
+	}
+	field := value.FieldByName(fieldName)
+	if !field.IsValid() {
+		return time.Time{}, false
+	}
+	at, ok := field.Interface().(time.Time)
+	if !ok || at.IsZero() {
+		return time.Time{}, false
+	}
+	at = at.In(effectiveShardingLocation(cfg.Location))
+	if field.CanSet() {
+		field.Set(reflect.ValueOf(at))
+	}
+	return at, true
 }
 
 // copyGeneratedValues 把 GORM 在分表插入中回填的字段同步给调用方的 []T。

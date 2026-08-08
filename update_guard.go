@@ -126,7 +126,7 @@ func primaryKeyWriteWithoutShardingKey(db *gorm.DB, cfg ShardingConfig) bool {
 		return true
 	}
 	where, ok := db.Statement.Clauses["WHERE"].Expression.(clause.Where)
-	return ok && exprsReferenceColumn(where.Exprs, primary)
+	return ok && exprsReferencePrimaryColumn(where.Exprs, primary)
 }
 
 // hasWriteShardingRoute 判断当前 Update/Delete 是否能从模型或 WHERE 中得到完整分表列表。
@@ -185,11 +185,11 @@ func exprsReferenceColumn(exprs []clause.Expression, column string) bool {
 	for _, expr := range exprs {
 		switch condition := expr.(type) {
 		case clause.Eq:
-			if writeConditionColumnMatches(condition.Column, column) {
+			if columnMatches(condition.Column, column) {
 				return true
 			}
 		case clause.IN:
-			if writeConditionColumnMatches(condition.Column, column) {
+			if columnMatches(condition.Column, column) {
 				return true
 			}
 		case clause.AndConditions:
@@ -213,8 +213,40 @@ func exprsReferenceColumn(exprs []clause.Expression, column string) bool {
 	return false
 }
 
-// writeConditionColumnMatches 同时识别真实主键列和 GORM 用于主键条件的占位列。
-func writeConditionColumnMatches(value interface{}, column string) bool {
+// exprsReferencePrimaryColumn 额外识别 GORM 用于主键条件的占位列。
+func exprsReferencePrimaryColumn(exprs []clause.Expression, column string) bool {
+	for _, expr := range exprs {
+		switch condition := expr.(type) {
+		case clause.Eq:
+			if primaryConditionColumnMatches(condition.Column, column) {
+				return true
+			}
+		case clause.IN:
+			if primaryConditionColumnMatches(condition.Column, column) {
+				return true
+			}
+		case clause.AndConditions:
+			if exprsReferencePrimaryColumn(condition.Exprs, column) {
+				return true
+			}
+		case clause.OrConditions:
+			if exprsReferencePrimaryColumn(condition.Exprs, column) {
+				return true
+			}
+		case clause.NotConditions:
+			if exprsReferencePrimaryColumn(condition.Exprs, column) {
+				return true
+			}
+		case clause.Expr:
+			if sqlExprReferencesColumn(condition.SQL, column) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func primaryConditionColumnMatches(value interface{}, column string) bool {
 	if columnMatches(value, column) {
 		return true
 	}

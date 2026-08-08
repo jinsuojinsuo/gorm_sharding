@@ -99,7 +99,8 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
 	defer cleanup()
 
-	base := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	current := time.Now().In(time.Local)
+	base := time.Date(current.Year(), current.Month(), current.Day(), 10, 0, 0, 0, time.Local)
 	oldAt := base.AddDate(0, 0, -2)
 	midAt := base.AddDate(0, 0, -1)
 	newAt := base
@@ -117,7 +118,7 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 		}
 	}
 
-	cfg := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, Location: time.Local, MaxScanTables: 2}
 	if tableExists(t, rawDB, prefix) {
 		t.Fatalf("logical template table %s was created", prefix)
 	}
@@ -748,7 +749,9 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 	db, rawDB, cleanup := newRequirementShardedDB(t, prefix, MonthStrategy, 5, requirementUserV1{})
 	defer cleanup()
 
-	createdAt := time.Date(2026, 1, 2, 3, 0, 0, 0, time.Local)
+	current := time.Now().In(time.Local)
+	previousMonth := time.Date(current.Year(), current.Month(), 1, 3, 0, 0, 0, time.Local).AddDate(0, -1, 0)
+	createdAt := previousMonth
 	if err := db.Create(&requirementUserV1{Name: "old", CreatedAt: createdAt, UpdatedAt: createdAt}).Error; err != nil {
 		t.Fatalf("create historical table failed: %v", err)
 	}
@@ -774,7 +777,7 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 		t.Fatalf("plugin AutoMigrate failed: %v", err)
 	}
 
-	table := ShardingConfig{TablePrefix: prefix, Strategy: MonthStrategy, MaxScanTables: 5}.tableName(createdAt)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: MonthStrategy, Location: time.Local, MaxScanTables: 5}.tableName(createdAt)
 	if !columnExists(t, rawDB, table, "age") {
 		t.Fatalf("historical shard %s does not have migrated age column", table)
 	}

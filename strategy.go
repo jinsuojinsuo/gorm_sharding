@@ -30,7 +30,10 @@ var (
 	// MonthStrategy 按月分表，表名后缀格式为 200601。
 	MonthStrategy = strategyFunc{
 		suffix: func(t time.Time) string { return t.Format("200601") },
-		prev:   func(t time.Time) time.Time { return t.AddDate(0, -1, 0) },
+		// 先归一到当月第一天再减一个月，避免 3 月 29 日减一个月被 Go 规范化为 3 月 1 日。
+		prev: func(t time.Time) time.Time {
+			return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location()).AddDate(0, -1, 0)
+		},
 	}
 	// WeekStrategy 按 ISO 周分表，表名后缀格式为 2006_w01。
 	WeekStrategy = strategyFunc{

@@ -65,7 +65,8 @@ func main() {
 	plugin := gorm_sharding.New()
 	// 同一个 DB 只创建一个插件实例；多张表需要分表时，对同一个插件 Register 多次。
 	// 注意：所有 Register 都要在 db.Use(plugin) 之前完成。
-	if err := plugin.Register(User{}, gorm_sharding.ShardingConfig{
+	if err := plugin.Register(gorm_sharding.ShardingConfig{
+		TablePrefix:     User{}.TableName(),         //逻辑表名，也是分表前缀
 		ShardingKey:     "created_at",               //分表字段
 		Strategy:        gorm_sharding.HourStrategy, //按小时分表
 		MaxScanTables:   3,                          //最大扫描10张表
@@ -74,7 +75,8 @@ func main() {
 	}); err != nil {
 		panic(err)
 	}
-	if err := plugin.Register(Order{}, gorm_sharding.ShardingConfig{
+	if err := plugin.Register(gorm_sharding.ShardingConfig{
+		TablePrefix:     Order{}.TableName(),         //逻辑表名，也是分表前缀
 		ShardingKey:     "created_at",                //分表字段
 		Strategy:        gorm_sharding.MonthStrategy, //订单表按月分表
 		MaxScanTables:   2,                           //无分表条件时最多扫描最近6张订单分表

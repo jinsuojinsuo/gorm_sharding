@@ -139,6 +139,9 @@ TIMESTAMP
 ```go
 type ShardingConfig struct {
 
+    // 逻辑表名和真实分表前缀，必须与模型 TableName() 返回值一致
+    TablePrefix string
+
     // 分表字段
     ShardingKey string
 
@@ -160,7 +163,7 @@ type ShardingConfig struct {
 }
 ```
 
-真实分表前缀不再放在配置中，插件会从 GORM 结构体逻辑表名中获取。模型实现 `TableName()` 时使用该返回值；未实现时使用 GORM 默认命名规则。
+`TablePrefix` 由业务侧显式配置。它必须与模型 `TableName()` 返回值一致；未实现 `TableName()` 时，填写 GORM 默认命名规则解析出的表名。每个逻辑表只能注册一次。
 
 
 ---
@@ -172,8 +175,8 @@ type ShardingConfig struct {
 
 ```go
 plugin.Register(
-    User{},
     ShardingConfig{
+        TablePrefix: "user",
         ShardingKey:"created_at",
 
         Strategy:

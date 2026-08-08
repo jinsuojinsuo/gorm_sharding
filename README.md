@@ -53,7 +53,8 @@ func main() {
 	}
 
 	plugin := gorm_sharding.New()
-	if err := plugin.Register(User{}, gorm_sharding.ShardingConfig{
+	if err := plugin.Register(gorm_sharding.ShardingConfig{
+		TablePrefix:     User{}.TableName(),
 		ShardingKey:     "created_at",
 		Strategy:        gorm_sharding.HourStrategy,
 		MaxScanTables:   3,
@@ -84,6 +85,10 @@ func main() {
 
 ```go
 type ShardingConfig struct {
+	// 逻辑表名和真实分表前缀，例如 user 会生成 user_202608。
+	// 必须与业务模型的 TableName() 返回值或 GORM 默认表名一致。
+	TablePrefix string
+
 	// 分表字段的数据库列名，例如 created_at。
 	ShardingKey string
 
@@ -101,7 +106,7 @@ type ShardingConfig struct {
 }
 ```
 
-真实分表前缀来自 GORM 逻辑表名。模型实现 `TableName()` 时使用该返回值；未实现时使用 GORM 默认命名规则。
+`TablePrefix` 由业务侧显式配置，插件不再接收模型参数。它必须与模型的 `TableName()` 返回值一致；未实现 `TableName()` 时，填写 GORM 默认命名规则解析出的表名。每个逻辑表只能注册一次。
 
 ## 分表策略
 

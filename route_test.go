@@ -12,7 +12,7 @@ func TestRouteExtractsTablesFromCommonWhereForms(t *testing.T) {
 	cfg := ShardingConfig{
 		Strategy:      DayStrategy,
 		MaxScanTables: 10,
-		tablePrefix:   "user",
+		TablePrefix:   "user",
 	}
 	t1 := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 	t2 := time.Date(2026, 8, 5, 10, 0, 0, 0, time.Local)

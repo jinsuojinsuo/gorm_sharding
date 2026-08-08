@@ -70,9 +70,16 @@ func (p *Plugin) buildCombinedQuery(db *gorm.DB, tables []string) (string, []int
 	}
 
 	// 先让 GORM 在 DryRun 模式构建原始 SELECT，保留 Where、Select、Group、Having 等语义。
+	// 这里直接调用保存的原始查询回调，不能再调用 Find：Find 会重新进入分表插件回调，
+	// 在嵌套 DryRun 中递归构建组合查询，并污染外层 Statement。
 	dryRun := db.Session(&gorm.Session{NewDB: true, DryRun: true}).Table(tables[0])
 	copyQueryState(dryRun, db)
-	dryRun = dryRun.Set(skipKey, true).Find(db.Statement.Dest)
+	dryRun.Statement.Dest = db.Statement.Dest
+	dryRun.Statement.Schema = db.Statement.Schema
+	dryRun.Statement.ReflectValue = db.Statement.ReflectValue
+	// 直接调用 gorm:query 会绕过 GORM processor；手动保留 Query 回调需要构建的子句顺序。
+	dryRun.Statement.BuildClauses = append([]string(nil), db.Callback().Query().Clauses...)
+	p.queryFn(dryRun)
 	if dryRun.Error != nil {
 		return "", nil, dryRun.Error
 	}

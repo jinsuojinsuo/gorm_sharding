@@ -39,7 +39,19 @@ func (m *tableManager) exists(db *gorm.DB, table string) bool {
 	if _, ok := m.seen.Load(table); ok {
 		return true
 	}
-	if !db.Migrator().HasTable(table) {
+
+	// 不使用 Migrator().HasTable：它内部通过 Raw(...).Row() 查询当前数据库，
+	// 会经过 Row 回调，在插件接管回调后无法安全嵌套。直接查询 information_schema
+	// 既能复用当前事务连接，也不会修改业务 Statement。
+	var count int64
+	metadataDB := db.Session(&gorm.Session{NewDB: true})
+	// 1146 恢复路径会携带上一次业务 SQL 的错误；元数据查询必须独立执行。
+	metadataDB.Error = nil
+	err := metadataDB.Raw(
+		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+		table,
+	).Scan(&count).Error
+	if err != nil || count == 0 {
 		return false
 	}
 	m.seen.Store(table, struct{}{})
@@ -132,12 +144,12 @@ func (m *tableManager) tables(db *gorm.DB, cfg ShardingConfig, now time.Time) []
 
 // tableListCacheKey 生成最近表列表缓存键；当前分片变化时键也变化，避免跨小时/天/月继续使用旧列表。
 func (m *tableManager) tableListCacheKey(cfg ShardingConfig, now time.Time) string {
-	return fmt.Sprintf("%s|%d|%s", cfg.tablePrefix, cfg.MaxScanTables, cfg.tableName(now))
+	return fmt.Sprintf("%s|%d|%s", cfg.TablePrefix, cfg.MaxScanTables, cfg.tableName(now))
 }
 
 // clearTableListCache 清理指定逻辑表前缀的最近表列表缓存；自动建新分表后需要刷新扫描列表。
 func (m *tableManager) clearTableListCache(cfg ShardingConfig) {
-	prefix := cfg.tablePrefix + "|"
+	prefix := cfg.TablePrefix + "|"
 	m.tableLists.Range(func(key, value interface{}) bool {
 		if strings.HasPrefix(key.(string), prefix) {
 			m.tableLists.Delete(key)
@@ -154,9 +166,14 @@ func (m *tableManager) existingTables(db *gorm.DB, cfg ShardingConfig) ([]string
 
 	var tables []string
 	// 按表名倒序取最近分表；当前策略的表名后缀都按时间递增，倒序就是从新到旧。
-	err := db.Raw(
+	// 元数据查询不能复用当前业务 Statement：Raw(...).Scan(...) 会设置 Dest、Schema 和 SQL，
+	// 从而破坏调用方随后执行的分表查询。NewDB Session 使用独立 Statement 保留同一连接配置。
+	metadataDB := db.Session(&gorm.Session{NewDB: true})
+	// 当前调用可能正在从 1146 恢复，不能让历史错误阻止 information_schema 查询。
+	metadataDB.Error = nil
+	err := metadataDB.Raw(
 		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
-		tableNameLikePattern(cfg.tablePrefix), cfg.MaxScanTables,
+		tableNameLikePattern(cfg.TablePrefix), cfg.MaxScanTables,
 	).Scan(&tables).Error
 	if err != nil {
 		return tables, err

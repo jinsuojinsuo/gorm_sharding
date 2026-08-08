@@ -302,12 +302,8 @@ func rawUpdateChangesShardingKey(update *sqlparser.Update, key string) bool {
 // configByPrefix 根据 Raw SQL 中出现的逻辑表名找到分表配置。
 func (p *Plugin) configByPrefix(name string) (ShardingConfig, bool) {
 	name = strings.Trim(name, "`")
-	for _, cfg := range p.configs {
-		if cfg.tablePrefix == name {
-			return cfg, true
-		}
-	}
-	return ShardingConfig{}, false
+	cfg, ok := p.configs[name]
+	return cfg, ok
 }
 
 // restorePositionalBindVars 把 Vitess 输出的 bind location 恢复为 MySQL driver 使用的 ? 占位符。

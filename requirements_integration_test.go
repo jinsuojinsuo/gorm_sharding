@@ -117,7 +117,7 @@ func TestRequirementCRUDAndRaw(t *testing.T) {
 		}
 	}
 
-	cfg := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}
 	if tableExists(t, rawDB, prefix) {
 		t.Fatalf("logical template table %s was created", prefix)
 	}
@@ -226,7 +226,7 @@ func TestRequirementCreateInBatchesAcrossShards(t *testing.T) {
 		t.Fatalf("CreateInBatches RowsAffected = %d, want %d", res.RowsAffected, len(users))
 	}
 
-	cfg := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}
+	cfg := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}
 	for _, tt := range []struct {
 		at   time.Time
 		want int64
@@ -273,7 +273,7 @@ func TestRequirementUnscopedAcrossShards(t *testing.T) {
 		t.Fatalf("unscoped update = rows:%d err:%v", result.RowsAffected, result.Error)
 	}
 	for _, at := range []time.Time{first, second} {
-		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
+		table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
 		if got := countRows(t, rawDB, table, "score = 99"); got != 1 {
 			t.Fatalf("unscoped update rows in %s = %d, want 1", table, got)
 		}
@@ -283,7 +283,7 @@ func TestRequirementUnscopedAcrossShards(t *testing.T) {
 		t.Fatalf("unscoped delete = rows:%d err:%v", result.RowsAffected, result.Error)
 	}
 	for _, at := range []time.Time{first, second} {
-		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
+		table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(at)
 		if got := countRows(t, rawDB, table, "1 = 1"); got != 0 {
 			t.Fatalf("unscoped delete rows in %s = %d, want 0", table, got)
 		}
@@ -315,7 +315,7 @@ func TestRequirementArrayCRUDAcrossShards(t *testing.T) {
 	}
 	for _, user := range users {
 		var score int
-		if err := rawDB.Table(ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)).
+		if err := rawDB.Table(ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)).
 			Where("name = ?", user.Name).Select("score").Scan(&score).Error; err != nil || score != 100 {
 			t.Fatalf("array update user %s = score:%d err:%v", user.Name, score, err)
 		}
@@ -325,7 +325,7 @@ func TestRequirementArrayCRUDAcrossShards(t *testing.T) {
 		t.Fatalf("array delete = rows:%d err:%v", result.RowsAffected, result.Error)
 	}
 	for _, user := range users {
-		table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)
+		table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(user.CreatedAt)
 		if got := countRows(t, rawDB, table, "name = '"+user.Name+"'"); got != 0 {
 			t.Fatalf("array delete rows in %s = %d, want 0", table, got)
 		}
@@ -360,7 +360,7 @@ func TestRequirementPreciseWriteWithAdditionalPredicates(t *testing.T) {
 		t.Fatalf("compound precise update RowsAffected = %d, want 1", res.RowsAffected)
 	}
 
-	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}.tableName(oldAt)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 2}.tableName(oldAt)
 	if got := countRows(t, rawDB, table, "name = 'target' AND score = 33"); got != 1 {
 		t.Fatalf("compound precise update did not hit old shard, rows = %d", got)
 	}
@@ -452,7 +452,7 @@ func TestRequirementMissingTableInvalidatesAfterSQL(t *testing.T) {
 		t.Fatalf("warm table-list cache failed: %v", err)
 	}
 
-	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}.tableName(now)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy, MaxScanTables: 3}.tableName(now)
 	if err := rawDB.Exec("DROP TABLE " + quoteIdent(table)).Error; err != nil {
 		t.Fatalf("drop test shard table failed: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 	cfg := ShardingConfig{
 		ShardingKey:     "created_at",
 		Strategy:        HourStrategy,
-		tablePrefix:     prefix,
+		TablePrefix:     prefix,
 		MaxScanTables:   2,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -522,7 +522,7 @@ func TestRequirementCreateNewShardInsideTransaction(t *testing.T) {
 	defer cleanup()
 
 	createdAt := time.Date(2026, 8, 6, 10, 0, 0, 0, time.Local)
-	table := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(createdAt)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(createdAt)
 	tx := db.Begin()
 	if tx.Error != nil {
 		t.Fatalf("begin transaction: %v", tx.Error)
@@ -596,7 +596,7 @@ func TestRequirementConcurrentCreateSameShard(t *testing.T) {
 			t.Fatalf("concurrent create returned error: %v", err)
 		}
 	}
-	table := ShardingConfig{tablePrefix: prefix, Strategy: HourStrategy, MaxScanTables: 3}.tableName(createdAt)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: HourStrategy, MaxScanTables: 3}.tableName(createdAt)
 	if got := countRows(t, rawDB, table, "1=1"); got != workers {
 		t.Fatalf("concurrent create rows = %d, want %d", got, workers)
 	}
@@ -605,7 +605,8 @@ func TestRequirementConcurrentCreateSameShard(t *testing.T) {
 // TestRequirementRejectsDuplicateInitialize 验证同一个插件实例不能重复绑定多个 DB。
 func TestRequirementRejectsDuplicateInitialize(t *testing.T) {
 	plugin := New()
-	if err := plugin.Register(requirementUser{}, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:     requirementUser{}.TableName(),
 		ShardingKey:     "created_at",
 		Strategy:        HourStrategy,
 		MaxScanTables:   3,
@@ -640,7 +641,8 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 	}
 
 	plugin := New()
-	if err := plugin.Register(requirementUserV2{}, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:     requirementUserV2{}.TableName(),
 		ShardingKey:     "created_at",
 		Strategy:        MonthStrategy,
 		MaxScanTables:   5,
@@ -658,7 +660,7 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 		t.Fatalf("plugin AutoMigrate failed: %v", err)
 	}
 
-	table := ShardingConfig{tablePrefix: prefix, Strategy: MonthStrategy, MaxScanTables: 5}.tableName(createdAt)
+	table := ShardingConfig{TablePrefix: prefix, Strategy: MonthStrategy, MaxScanTables: 5}.tableName(createdAt)
 	if !columnExists(t, rawDB, table, "age") {
 		t.Fatalf("historical shard %s does not have migrated age column", table)
 	}
@@ -672,7 +674,8 @@ func newRequirementShardedDB(t *testing.T, prefix string, strategy ShardingStrat
 	cleanupRequirementPrefix(t, rawDB, prefix)
 
 	plugin := New()
-	if err := plugin.Register(model, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:     prefix,
 		ShardingKey:     "created_at",
 		Strategy:        strategy,
 		MaxScanTables:   maxScanTables,

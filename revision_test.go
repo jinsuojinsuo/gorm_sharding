@@ -168,7 +168,8 @@ func TestRegisterRejectsAfterInitialize(t *testing.T) {
 	plugin := New()
 	plugin.initialized = true
 
-	if err := plugin.Register(requirementUser{}, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:   requirementUser{}.TableName(),
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
 		MaxScanTables: 1,
@@ -180,7 +181,8 @@ func TestRegisterRejectsAfterInitialize(t *testing.T) {
 // TestAutoMigrateRequiresInitialize 验证未执行 db.Use 前调用插件迁移会返回错误，而不是解引用空表管理器。
 func TestAutoMigrateRequiresInitialize(t *testing.T) {
 	plugin := New()
-	if err := plugin.Register(requirementUser{}, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:   requirementUser{}.TableName(),
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
 		MaxScanTables: 1,
@@ -247,7 +249,7 @@ func TestTableNameLikePatternEscapesWildcards(t *testing.T) {
 
 // TestRouteDoesNotMatchSimilarColumnName 防止 other_created_at 等相似字段被误识别为分表字段。
 func TestRouteDoesNotMatchSimilarColumnName(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 1}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 1}
 	at := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 
 	if _, ok := tablesFromExprs([]clause.Expression{
@@ -259,7 +261,7 @@ func TestRouteDoesNotMatchSimilarColumnName(t *testing.T) {
 
 // TestHalfOpenRangeWithOneShardScansStartShard 防止 [start, end) 的上界把唯一扫描槽位占掉。
 func TestHalfOpenRangeWithOneShardScansStartShard(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: HourStrategy, MaxScanTables: 1}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: HourStrategy, MaxScanTables: 1}
 	start := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 	end := start.Add(time.Hour)
 
@@ -276,7 +278,7 @@ func TestHalfOpenRangeWithOneShardScansStartShard(t *testing.T) {
 
 // TestRangeRouteUsesIntersectionBounds 验证多个范围条件按交集计算，避免条件顺序导致漏扫。
 func TestRangeRouteUsesIntersectionBounds(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	day1 := time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)
 	day2 := day1.AddDate(0, 0, 1)
 	day3 := day1.AddDate(0, 0, 2)
@@ -296,7 +298,7 @@ func TestRangeRouteUsesIntersectionBounds(t *testing.T) {
 
 // TestRangeRouteMergesSeparateWhereExpressions 验证多次 Where 产生的独立表达式会合并为同一范围。
 func TestRangeRouteMergesSeparateWhereExpressions(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, 2)
 
@@ -320,7 +322,7 @@ func TestRangeRouteMergesChainedWhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open dry-run database: %v", err)
 	}
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, 2)
 	query := db.Model(&requirementUser{}).
@@ -348,7 +350,7 @@ func TestReadRouteIgnoresResultValue(t *testing.T) {
 		t.Fatalf("open dry-run database: %v", err)
 	}
 
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy, MaxScanTables: 10}
 	start := time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, 2)
 	result := revisionDistinctUser{CreatedAt: start.AddDate(0, 0, 30)}
@@ -367,7 +369,7 @@ func TestReadRouteIgnoresResultValue(t *testing.T) {
 
 // TestReverseRangeRoutesNoTables 验证上界早于下界的矛盾范围不扫描任何分表。
 func TestReverseRangeRoutesNoTables(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	start := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 0, -2)
 	tables, ok := tablesFromExprs([]clause.Expression{
@@ -383,7 +385,7 @@ func TestReverseRangeRoutesNoTables(t *testing.T) {
 
 // TestEqualHalfOpenRangeRoutesNoTables 验证分片边界上的 [t, t) 半开区间不会扫描历史分表。
 func TestEqualHalfOpenRangeRoutesNoTables(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	at := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local)
 
 	tables, ok := tablesFromExprs([]clause.Expression{
@@ -399,7 +401,7 @@ func TestEqualHalfOpenRangeRoutesNoTables(t *testing.T) {
 
 // TestEqualOpenStartRangeRoutesNoTables 验证 (t, t] 的排他下界范围不会扫描任何分表。
 func TestEqualOpenStartRangeRoutesNoTables(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 10}
 	at := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
 
 	tables, ok := tablesFromExprs([]clause.Expression{
@@ -416,8 +418,8 @@ func TestEqualOpenStartRangeRoutesNoTables(t *testing.T) {
 // TestRawWriteLimitAcrossShardsIsRejected 验证 Raw 写入命中多张分表时拒绝 LIMIT 语义。
 func TestRawWriteLimitAcrossShardsIsRejected(t *testing.T) {
 	plugin := New()
-	plugin.configs[reflect.TypeOf(revisionDistinctUser{})] = ShardingConfig{
-		tablePrefix:   "user",
+	plugin.configs["user"] = ShardingConfig{
+		TablePrefix:   "user",
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
 		MaxScanTables: 10,
@@ -485,7 +487,7 @@ func TestGroupDeleteValuesByShard(t *testing.T) {
 		{ID: 1, CreatedAt: first},
 		{ID: 2, CreatedAt: second},
 	})
-	cfg := ShardingConfig{tablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
+	cfg := ShardingConfig{TablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
 
 	groups, grouped, err := New().groupDeleteValues(db, cfg)
 	if err != nil || !grouped {
@@ -519,7 +521,7 @@ func TestGroupUpdateValuesByShard(t *testing.T) {
 		{ID: 1, CreatedAt: first},
 		{ID: 2, CreatedAt: second},
 	})
-	cfg := ShardingConfig{tablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
+	cfg := ShardingConfig{TablePrefix: "user", ShardingKey: "created_at", Strategy: DayStrategy}
 
 	groups, grouped, err := New().groupUpdateValues(db, cfg)
 	if err != nil || !grouped {
@@ -611,7 +613,7 @@ func TestReverseRangeReturnsEmptyResult(t *testing.T) {
 
 // TestRawStatementRoutesHistoricalExactTime 防止 Raw 查询忽略时间条件而固定路由到最新分表。
 func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
 	oldAt := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
 	stmt, err := sqlparser.NewTestParser().Parse("SELECT * FROM user WHERE created_at = ?")
 	if err != nil {
@@ -626,7 +628,7 @@ func TestRawStatementRoutesHistoricalExactTime(t *testing.T) {
 
 // TestRawStatementDetectsMultipleShards 防止 Raw 跨分表条件被静默改写到一张表。
 func TestRawStatementDetectsMultipleShards(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
 	t1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
 	t2 := t1.AddDate(0, 0, 1)
 	stmt, err := sqlparser.NewTestParser().Parse("SELECT * FROM user WHERE created_at IN (?, ?)")
@@ -643,8 +645,8 @@ func TestRawStatementDetectsMultipleShards(t *testing.T) {
 // TestRawJoinWriteIsRejected 验证包含逻辑分表的 Raw JOIN 写入不会回退执行原始 SQL。
 func TestRawJoinWriteIsRejected(t *testing.T) {
 	plugin := New()
-	plugin.configs[modelKey(requirementUser{})] = ShardingConfig{
-		tablePrefix: "gs_req_user",
+	plugin.configs["gs_req_user"] = ShardingConfig{
+		TablePrefix: "gs_req_user",
 		ShardingKey: "created_at",
 		Strategy:    DayStrategy,
 	}
@@ -662,7 +664,7 @@ func TestRawJoinWriteIsRejected(t *testing.T) {
 
 // TestRouteParsesSliceArgumentIn 防止 created_at IN ? 的时间切片退化为最近表扫描。
 func TestRouteParsesSliceArgumentIn(t *testing.T) {
-	cfg := ShardingConfig{tablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
+	cfg := ShardingConfig{TablePrefix: "user", Strategy: DayStrategy, MaxScanTables: 2}
 	t1 := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
 	t2 := t1.AddDate(0, 0, 1)
 	tables, ok := tablesFromExprs([]clause.Expression{
@@ -822,32 +824,28 @@ func TestCrossShardOrderLimitScan(t *testing.T) {
 	}
 }
 
-// TestInitializeRejectsDuplicateLogicalTableName 验证不同模型不能注册为同一个逻辑表名。
-func TestInitializeRejectsDuplicateLogicalTableName(t *testing.T) {
+// TestRegisterRejectsDuplicateTablePrefix 验证同一个逻辑表名不能重复注册。
+func TestRegisterRejectsDuplicateTablePrefix(t *testing.T) {
 	plugin := New()
-	for _, model := range []interface{}{revisionDuplicateUser{}, revisionDuplicateOrder{}} {
-		if err := plugin.Register(model, ShardingConfig{
-			ShardingKey:   "created_at",
-			Strategy:      DayStrategy,
-			MaxScanTables: 1,
-		}); err != nil {
-			t.Fatalf("register model: %v", err)
-		}
+	cfg := ShardingConfig{
+		TablePrefix:   revisionDuplicateUser{}.TableName(),
+		ShardingKey:   "created_at",
+		Strategy:      DayStrategy,
+		MaxScanTables: 1,
 	}
-
-	db, err := gorm.Open(mysql.New(mysql.Config{SkipInitializeWithVersion: true}), &gorm.Config{DisableAutomaticPing: true})
-	if err != nil {
-		t.Fatalf("open dry-run database: %v", err)
+	if err := plugin.Register(cfg); err != nil {
+		t.Fatalf("first register: %v", err)
 	}
-	if err := plugin.Initialize(db); err == nil {
-		t.Fatal("initialize with duplicate logical table name returned nil")
+	if err := plugin.Register(cfg); err == nil {
+		t.Fatal("duplicate table prefix registration returned nil")
 	}
 }
 
-// TestInitializeRejectsGoFieldNameAsShardingKey 验证 ShardingKey 只能填写数据库列名。
-func TestInitializeRejectsGoFieldNameAsShardingKey(t *testing.T) {
+// TestConfigForRejectsGoFieldNameAsShardingKey 验证 ShardingKey 只能填写数据库列名。
+func TestConfigForRejectsGoFieldNameAsShardingKey(t *testing.T) {
 	plugin := New()
-	if err := plugin.Register(revisionDistinctUser{}, ShardingConfig{
+	if err := plugin.Register(ShardingConfig{
+		TablePrefix:   revisionDistinctUser{}.TableName(),
 		ShardingKey:   "CreatedAt",
 		Strategy:      DayStrategy,
 		MaxScanTables: 1,
@@ -859,8 +857,13 @@ func TestInitializeRejectsGoFieldNameAsShardingKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open dry-run database: %v", err)
 	}
-	if err := plugin.Initialize(db); err == nil {
-		t.Fatal("initialize with Go field name sharding key returned nil")
+	statement := &gorm.Statement{DB: db}
+	if err := statement.Parse(&revisionDistinctUser{}); err != nil {
+		t.Fatalf("parse model schema: %v", err)
+	}
+	_, ok, err := plugin.configFor(&gorm.DB{Statement: statement})
+	if !ok || err == nil {
+		t.Fatalf("configFor result = registered:%v error:%v; want registered validation error", ok, err)
 	}
 }
 
@@ -1178,7 +1181,7 @@ func TestCrossShardDistinctLimitKeepsUniqueRows(t *testing.T) {
 	}
 }
 
-// TestCrossShardAggregateStats 验证 SUM、MIN、MAX、AVG 在多个分表上的最终结果由 Go 正确合并。
+// TestCrossShardAggregateStats 验证 SUM、MIN、MAX、AVG 在多个分表上由 MySQL 全局计算。
 func TestCrossShardAggregateStats(t *testing.T) {
 	prefix := requirementUser{}.TableName()
 	db, _, cleanup := newRequirementShardedDB(t, prefix, DayStrategy, 2, requirementUser{})
@@ -1208,8 +1211,9 @@ func TestCrossShardAggregateStats(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("cross-shard aggregate: %v", result.Error)
 	}
-	if got.Total != 13 || got.Min != 1 || got.Max != 10 || got.Avg != 13.0/3.0 {
-		t.Fatalf("aggregate = %+v, want total=13 min=1 max=10 avg=%v", got, 13.0/3.0)
+	// MySQL 对整型 AVG 返回 DECIMAL，默认保留四位小数；跨分表结果应与单表 MySQL 一致。
+	if got.Total != 13 || got.Min != 1 || got.Max != 10 || math.Abs(got.Avg-4.3333) > 0.0000001 {
+		t.Fatalf("aggregate = %+v, want total=13 min=1 max=10 avg=4.3333", got)
 	}
 }
 
@@ -1379,7 +1383,7 @@ func TestRawUpdateAcrossShardsSkipsMissingShard(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatalf("create rollback rows: %v", err)
 	}
-	missingTable := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day1)
+	missingTable := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(day1)
 	if err := rawDB.Migrator().DropTable(missingTable); err != nil {
 		t.Fatalf("drop second raw update shard: %v", err)
 	}
@@ -1388,7 +1392,7 @@ func TestRawUpdateAcrossShardsSkipsMissingShard(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("raw update with missing shard: %v", result.Error)
 	}
-	remainingTable := ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day2)
+	remainingTable := ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(day2)
 	var score int
 	if err := rawDB.Table(remainingTable).Select("score").Where("name = ?", "second").Scan(&score).Error; err != nil {
 		t.Fatalf("read row after missing shard: %v", err)
@@ -1430,8 +1434,8 @@ func TestRawUpdateAcrossShardsUsesOuterTransaction(t *testing.T) {
 		name  string
 		want  int
 	}{
-		{ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day1), "first", 1},
-		{ShardingConfig{tablePrefix: prefix, Strategy: DayStrategy}.tableName(day2), "second", 2},
+		{ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(day1), "first", 1},
+		{ShardingConfig{TablePrefix: prefix, Strategy: DayStrategy}.tableName(day2), "second", 2},
 	} {
 		var score int
 		if err := rawDB.Table(check.table).Select("score").Where("name = ?", check.name).Scan(&score).Error; err != nil {

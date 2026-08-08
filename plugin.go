@@ -21,7 +21,7 @@ type Plugin struct {
 	initMu      sync.Mutex
 	initialized bool
 
-	configs map[reflect.Type]ShardingConfig
+	configs map[string]ShardingConfig
 	manager *tableManager
 
 	// 保存 GORM 原始核心回调，分表插件完成路由后仍交回 GORM 执行，
@@ -36,7 +36,7 @@ type Plugin struct {
 
 // New 创建一个新的分表插件实例。
 func New() *Plugin {
-	return &Plugin{configs: make(map[reflect.Type]ShardingConfig)}
+	return &Plugin{configs: make(map[string]ShardingConfig)}
 }
 
 // Name 返回 GORM 插件名称。
@@ -44,8 +44,9 @@ func (p *Plugin) Name() string {
 	return pluginName
 }
 
-// Register 注册模型和对应分表配置。
-func (p *Plugin) Register(model interface{}, cfg ShardingConfig) error {
+// Register 注册一个逻辑表的分表配置。
+// TablePrefix 必须与业务模型的 TableName() 返回值（或 GORM 默认表名）一致。
+func (p *Plugin) Register(cfg ShardingConfig) error {
 	p.initMu.Lock()
 	defer p.initMu.Unlock()
 	if p.initialized {
@@ -54,11 +55,10 @@ func (p *Plugin) Register(model interface{}, cfg ShardingConfig) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
-	t := modelKey(model)
-	if t == nil || t.Kind() != reflect.Struct {
-		return fmt.Errorf("gorm_sharding: model must be struct or struct pointer")
+	if _, exists := p.configs[cfg.TablePrefix]; exists {
+		return fmt.Errorf("gorm_sharding: table prefix %s has already been registered", cfg.TablePrefix)
 	}
-	p.configs[t] = cfg
+	p.configs[cfg.TablePrefix] = cfg
 	return nil
 }
 
@@ -69,10 +69,6 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 	if p.initialized {
 		return fmt.Errorf("gorm_sharding: plugin has already been initialized")
 	}
-	if err := p.resolveTablePrefixes(db); err != nil {
-		return err
-	}
-
 	p.manager = newTableManager(db)
 
 	// Replace 之前先取出原始回调；后续插件回调内部会在改完表名后调用它们。
@@ -104,31 +100,6 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 	return nil
 }
 
-// resolveTablePrefixes 使用 GORM schema 解析注册模型的逻辑表名，作为真实分表前缀。
-func (p *Plugin) resolveTablePrefixes(db *gorm.DB) error {
-	cache := &sync.Map{}
-	prefixes := make(map[string]reflect.Type, len(p.configs))
-	for modelType, cfg := range p.configs {
-		model := reflect.New(modelType).Interface()
-		parsed, err := schema.Parse(model, cache, db.Config.NamingStrategy)
-		if err != nil {
-			return err
-		}
-		// ShardingKey 统一使用数据库列名，避免 Go 字段名与 SQL 条件列名不一致导致路由退化。
-		field := parsed.LookUpField(cfg.ShardingKey)
-		if field == nil || field.DBName != cfg.ShardingKey {
-			return fmt.Errorf("gorm_sharding: sharding key %s must be a database column name", cfg.ShardingKey)
-		}
-		if previous, exists := prefixes[parsed.Table]; exists {
-			return fmt.Errorf("gorm_sharding: models %s and %s use the same logical table %s", previous, modelType, parsed.Table)
-		}
-		prefixes[parsed.Table] = modelType
-		cfg.tablePrefix = parsed.Table
-		p.configs[modelType] = cfg
-	}
-	return nil
-}
-
 // AutoMigrate 迁移已注册模型最近 MaxScanTables 张历史分表，不创建逻辑模板表。
 func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	p.initMu.Lock()
@@ -139,9 +110,16 @@ func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	}
 
 	for _, model := range models {
-		cfg, ok := p.configs[modelKey(model)]
+		parsed, err := schema.Parse(model, &sync.Map{}, db.Config.NamingStrategy)
+		if err != nil {
+			return err
+		}
+		cfg, ok := p.configs[parsed.Table]
 		if !ok || !cfg.AutoMigrate {
 			continue
+		}
+		if err := validateShardingKey(parsed, cfg); err != nil {
+			return err
 		}
 		// 需求要求无模板表，所以这里不迁移逻辑表，只迁移已经存在的历史分表。
 		if err := p.manager.autoMigrate(db, model, cfg); err != nil {
@@ -152,31 +130,42 @@ func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 }
 
 // configFor 根据当前 GORM Statement 找到模型对应的分表配置。
-func (p *Plugin) configFor(db *gorm.DB) (ShardingConfig, bool) {
+func (p *Plugin) configFor(db *gorm.DB) (ShardingConfig, bool, error) {
 	if skipped, ok := db.Get(skipKey); ok && skipped == true {
-		return ShardingConfig{}, false
+		return ShardingConfig{}, false, nil
 	}
 	if db.Statement == nil {
-		return ShardingConfig{}, false
+		return ShardingConfig{}, false, nil
 	}
 	if db.Statement.Schema != nil {
-		cfg, ok := p.configs[db.Statement.Schema.ModelType]
-		return cfg, ok
+		cfg, ok := p.configs[db.Statement.Schema.Table]
+		if !ok {
+			return ShardingConfig{}, false, nil
+		}
+		if err := validateShardingKey(db.Statement.Schema, cfg); err != nil {
+			return ShardingConfig{}, true, err
+		}
+		return cfg, true, nil
 	}
-	if db.Statement.Model != nil {
-		cfg, ok := p.configs[modelKey(db.Statement.Model)]
-		return cfg, ok
+	return ShardingConfig{}, false, nil
+}
+
+// validateShardingKey 确认配置的分表字段是当前 GORM 模型的数据库列名。
+func validateShardingKey(parsed *schema.Schema, cfg ShardingConfig) error {
+	field := parsed.LookUpField(cfg.ShardingKey)
+	if field == nil || field.DBName != cfg.ShardingKey {
+		return fmt.Errorf("gorm_sharding: sharding key %s must be a database column name", cfg.ShardingKey)
 	}
-	if db.Statement.Dest != nil {
-		cfg, ok := p.configs[modelKey(db.Statement.Dest)]
-		return cfg, ok
-	}
-	return ShardingConfig{}, false
+	return nil
 }
 
 // create 处理插入路由、自动建表和批量插入分组。
 func (p *Plugin) create(db *gorm.DB) {
-	cfg, ok := p.configFor(db)
+	cfg, ok, err := p.configFor(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
 	if !ok {
 		p.createFn(db)
 		return
@@ -292,7 +281,11 @@ func (p *Plugin) query(db *gorm.DB) {
 		return
 	}
 
-	cfg, ok := p.configFor(db)
+	cfg, ok, err := p.configFor(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
 	if !ok {
 		p.queryFn(db)
 		return
@@ -344,7 +337,11 @@ func (p *Plugin) delete(db *gorm.DB) {
 
 // execUpdateAcrossTables 执行 Update 的单表路由或多表扫描逻辑。
 func (p *Plugin) execUpdateAcrossTables(db *gorm.DB) {
-	cfg, ok := p.configFor(db)
+	cfg, ok, err := p.configFor(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
 	if !ok {
 		p.updateFn(db)
 		return
@@ -458,7 +455,11 @@ func (p *Plugin) execUpdateGroups(db *gorm.DB, cfg ShardingConfig, groups map[st
 
 // execDeleteAcrossTables 执行 Delete 的单表路由或多表扫描逻辑。
 func (p *Plugin) execDeleteAcrossTables(db *gorm.DB) {
-	cfg, ok := p.configFor(db)
+	cfg, ok, err := p.configFor(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
 	if !ok {
 		p.deleteFn(db)
 		return
@@ -602,7 +603,11 @@ func (p *Plugin) row(db *gorm.DB) {
 		return
 	}
 
-	cfg, ok := p.configFor(db)
+	cfg, ok, err := p.configFor(db)
+	if err != nil {
+		db.AddError(err)
+		return
+	}
 	if !ok {
 		p.rowFn(db)
 		return

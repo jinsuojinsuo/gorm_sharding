@@ -2,7 +2,6 @@ package gorm_sharding
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 )
@@ -17,6 +16,10 @@ type ShardingStrategy interface {
 
 // ShardingConfig 定义单个模型的分表配置。
 type ShardingConfig struct {
+	// TablePrefix 是逻辑表名和真实分表前缀，例如 users 会生成 users_202608。
+	// 必须与业务模型的 TableName() 返回值（或 GORM 默认表名）保持一致。
+	TablePrefix string
+
 	// ShardingKey 是分表字段的数据库列名，例如 created_at。
 	ShardingKey string
 
@@ -31,13 +34,13 @@ type ShardingConfig struct {
 
 	// AutoMigrate 控制调用插件 AutoMigrate 时是否迁移该模型的历史分表。
 	AutoMigrate bool
-
-	// tablePrefix 是从模型逻辑表名解析出来的真实分表前缀，例如 user 会生成 user_202608。
-	tablePrefix string
 }
 
 // validate 校验分表配置是否具备运行所需的必要参数。
 func (c ShardingConfig) validate() error {
+	if c.TablePrefix == "" {
+		return fmt.Errorf("gorm_sharding: table prefix is empty")
+	}
 	if c.ShardingKey == "" {
 		return fmt.Errorf("gorm_sharding: sharding key is empty")
 	}
@@ -52,22 +55,7 @@ func (c ShardingConfig) validate() error {
 
 // tableName 根据配置和时间生成真实分表名。
 func (c ShardingConfig) tableName(t time.Time) string {
-	return c.tablePrefix + "_" + c.Strategy.Suffix(t)
-}
-
-// modelKey 把 struct、指针、slice 等模型输入统一归一成 struct 类型。
-func modelKey(v interface{}) reflect.Type {
-	t := reflect.TypeOf(v)
-	for t != nil && t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if t != nil && t.Kind() == reflect.Slice {
-		t = t.Elem()
-		for t.Kind() == reflect.Ptr {
-			t = t.Elem()
-		}
-	}
-	return t
+	return c.TablePrefix + "_" + c.Strategy.Suffix(t)
 }
 
 // normalizeColumnName 去掉列名两侧空白和反引号，便于比较 GORM 条件里的字段名。

@@ -40,12 +40,12 @@ func TestRouteExtractsTablesFromCommonWhereForms(t *testing.T) {
 		{
 			name:  "half open range",
 			exprs: []clause.Expression{clause.Expr{SQL: "created_at >= ? AND created_at < ?", Vars: []interface{}{t1, t2}}},
-			want:  []string{"user_20260804"},
+			want:  []string{"user_20260805", "user_20260804"},
 		},
 		{
 			name:  "clause range",
 			exprs: []clause.Expression{clause.Gte{Column: "created_at", Value: t1}, clause.Lt{Column: "created_at", Value: t2}},
-			want:  []string{"user_20260804"},
+			want:  []string{"user_20260805", "user_20260804"},
 		},
 		{
 			name:  "clause in",

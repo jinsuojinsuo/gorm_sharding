@@ -185,11 +185,11 @@ func exprsReferenceColumn(exprs []clause.Expression, column string) bool {
 	for _, expr := range exprs {
 		switch condition := expr.(type) {
 		case clause.Eq:
-			if columnMatches(condition.Column, column) {
+			if writeConditionColumnMatches(condition.Column, column) {
 				return true
 			}
 		case clause.IN:
-			if columnMatches(condition.Column, column) {
+			if writeConditionColumnMatches(condition.Column, column) {
 				return true
 			}
 		case clause.AndConditions:
@@ -211,6 +211,15 @@ func exprsReferenceColumn(exprs []clause.Expression, column string) bool {
 		}
 	}
 	return false
+}
+
+// writeConditionColumnMatches 同时识别真实主键列和 GORM 用于主键条件的占位列。
+func writeConditionColumnMatches(value interface{}, column string) bool {
+	if columnMatches(value, column) {
+		return true
+	}
+	conditionColumn, ok := value.(clause.Column)
+	return ok && conditionColumn.Name == clause.PrimaryKey
 }
 
 // sqlExprReferencesColumn 使用 Vitess AST 判断字符串 WHERE 条件是否引用指定列。

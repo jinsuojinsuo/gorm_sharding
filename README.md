@@ -6,11 +6,11 @@
 
 1. 支持按年、月、周、日、小时分表。
 2. 支持 `time.Time` 分表字段；`ShardingKey` 只支持数据库列名。
-3. 插入时自动计算目标表，并在表不存在时使用 GORM `AutoMigrate` 自动创建。
+3. 插入时自动计算目标表，并在表不存在时使用 GORM `AutoMigrate` 自动创建；可按时间窗口自动清理过期分表。
 4. 批量插入会按目标分表自动拆分。
-5. 查询只根据 `WHERE` 中的分表字段精确路由；不包含可识别分表字段时最多扫描最近 `MaxScanTables` 张表。
+5. 查询只根据 `WHERE` 中的分表字段精确路由；不包含可识别分表字段时最多扫描最近 `MaxScanTables` 个时间周期内存在的表。
 6. 单模型、单逻辑表的跨分表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
-7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`；跨分表时不支持 `Limit`。
+7. Update/Delete 支持精确路由和最近 N 个周期扫描，并累加 `RowsAffected`；跨分表时不支持 `Limit`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
 9. 支持显式调用 `gorm_sharding.AutoMigrate(db, model)` 同步历史分表字段。
 10. 不创建逻辑模板表，例如只创建 `user_2026080417`，不创建 `user`。
@@ -54,10 +54,11 @@ func main() {
 
 	plugin := gorm_sharding.New()
 	if err := plugin.Register(gorm_sharding.ShardingConfig{
-		TablePrefix:     User{}.TableName(),
-		ShardingKey:     "created_at",
-		Strategy:        gorm_sharding.HourStrategy,
-		MaxScanTables:   3,
+	TablePrefix:     User{}.TableName(),
+	ShardingKey:     "created_at",
+	Strategy:        gorm_sharding.HourStrategy,
+	Location:        time.Local,
+	MaxScanTables:   3,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
 	}); err != nil {
@@ -95,8 +96,15 @@ type ShardingConfig struct {
 	// 分表策略，决定表名后缀和最近表倒推粒度。
 	Strategy ShardingStrategy
 
-	// 无分表条件时最多扫描的最近分表数量。
+	// 分表使用的固定时区，例如 time.Local 或 time.UTC；必须显式配置。
+	Location *time.Location
+
+	// 无分表条件时最多扫描的最近连续时间周期数。
 	MaxScanTables int
+
+	// 自动保留的连续时间周期数；0 表示不自动删除历史分表。
+	// 大于 0 时 Strategy 必须正确实现 ParseSuffix。
+	MaxRetainTables int
 
 	// 插入目标表不存在时是否自动建表。
 	AutoCreateTable bool
@@ -107,6 +115,22 @@ type ShardingConfig struct {
 ```
 
 `TablePrefix` 由业务侧显式配置，插件不再接收模型参数。它必须与模型的 `TableName()` 返回值一致；未实现 `TableName()` 时，填写 GORM 默认命名规则解析出的表名。每个逻辑表只能注册一次。
+
+`Location` 必须显式配置，插件会在所有表名计算、范围路由、最近周期扫描和自动清理时将时间转换到该时区。相同时间点使用 UTC 与 `Asia/Shanghai` 可能属于不同日期或小时分表，业务进程必须为同一逻辑表使用同一 `Location`。
+
+### 自动清理历史分表
+
+`MaxRetainTables` 按时间窗口而非实际已建表数量计算。设为 `N` 后，插件在创建当前周期的新分表成功时，保留当前周期及此前连续 `N-1` 个周期，并删除窗口外可识别的同前缀分表。例如按月分表且 `MaxRetainTables: 3`，在 2026 年 8 月创建新分表后保留 `202606`、`202607`、`202608`，删除更早月份的表；中间某月未建表也计入窗口。
+
+自动清理支持内置和自定义策略。自定义 `ShardingStrategy` 必须正确实现 `ParseSuffix`，将真实分表后缀解析为该分表周期的开始时间；无法解析的同前缀表不会被删除。启用自动清理时，`MaxRetainTables` 必须大于或等于 `MaxScanTables`，否则 `Register` 会返回错误。外层事务内首次建表不会执行清理，避免 MySQL `DROP TABLE` 的隐式提交影响业务事务。
+
+```go
+type ShardingStrategy interface {
+	Suffix(time.Time) string
+	Prev(time.Time) time.Time
+	ParseSuffix(suffix string, location *time.Location) (time.Time, bool)
+}
+```
 
 ## 分表策略
 
@@ -178,7 +202,7 @@ var users []User
 err := db.Where("name = ?", "alice").Find(&users).Error
 ```
 
-该场景不会扫描全部历史表，只会扫描最近 `MaxScanTables` 张真实分表。
+该场景不会扫描全部历史表，只会扫描最近 `MaxScanTables` 个时间周期内存在的真实分表。中间周期未建表时，不会向更早周期补足扫描数量。
 
 ### 跨分表聚合
 
@@ -268,7 +292,7 @@ db.Where(clause.Gte{Column: "created_at", Value: start}).
 db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
 ```
 
-如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 张真实分表。
+如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 个时间周期内存在的真实分表；中间周期未建表时，不会向更早周期补足扫描数量。
 
 多个范围条件会按 `AND` 交集计算：下界取较晚时间，上界取较早时间；不会因范围分别写在多次 `Where` 调用中而退化为最近表扫描。
 
@@ -316,13 +340,13 @@ err := db.Raw("SELECT * FROM user WHERE created_at = ?", createdAt).Scan(&users)
 
 Raw SQL 中的逻辑表名会通过 Vitess SQL AST 改写为真实分表名。
 
-Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。命中多张分表的 Raw `UPDATE`、`DELETE` 不支持 `LIMIT`，会返回 `gorm_sharding: limit across shards is not supported`。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。子查询可以访问普通非分表表，但不能引用已注册的逻辑分表；插件不会递归改写子查询中的逻辑表名。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 张分表，**不保证覆盖全部历史分表**；需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
+Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中多张表时会返回 `gorm_sharding: raw SQL across shards is not supported`。Raw `UPDATE`、`DELETE` 支持单模型、单逻辑表命中多张真实分表：插件会基于同一份 SQL AST 逐表执行并累加 `RowsAffected`。调用方已开启事务时复用外层事务；未开启事务时插件创建内部事务，除 `1146 Table doesn't exist` 外任一分表失败会回滚已执行的分表写入。`1146` 缺失分表按空表跳过并清理缓存。命中多张分表的 Raw `UPDATE`、`DELETE` 不支持 `LIMIT`，会返回 `gorm_sharding: limit across shards is not supported`。Raw `UPDATE ... JOIN`、多表 `DELETE`、派生表写入会返回 `gorm_sharding: raw multi-table write is not supported`。子查询可以访问普通非分表表，但不能引用已注册的逻辑分表；插件不会递归改写子查询中的逻辑表名。未包含可识别分表字段的 Raw 写操作只会扫描最近 `MaxScanTables` 个时间周期内存在的分表，**不保证覆盖全部历史分表**；中间周期未建表时不会向更早周期补足扫描数量。需要处理完整历史数据时，必须提供可识别的分表字段时间条件。Raw `INSERT` 到逻辑分表名会直接报错，请使用 `Create`，避免历史时间数据被写到错误分表。
 
 不要通过连接串的 `multiStatements=true` 拼接多条跨分表 SQL。Raw `UPDATE`、`DELETE` 的多分表执行由插件管理；跨分表读取请使用 `Find`。
 
 ## 自动迁移
 
-最近 `MaxScanTables` 张历史分表的字段同步使用插件提供的迁移方法：
+最近 `MaxScanTables` 个时间周期内存在的历史分表字段同步使用插件提供的迁移方法：
 
 ```go
 if err := gorm_sharding.AutoMigrate(db, &User{}); err != nil {

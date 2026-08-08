@@ -149,9 +149,16 @@ type ShardingConfig struct {
     // 分表策略
     Strategy ShardingStrategy
 
+    // 分表使用的固定时区，例如 time.Local 或 time.UTC；必须显式配置。
+    Location *time.Location
 
-    // 最大扫描表数量
+
+    // 最大扫描的连续时间周期数量
     MaxScanTables int
+
+    // 自动保留的连续时间周期数；0 表示不自动删除历史分表。
+    // 大于 0 时 Strategy 必须正确实现 ParseSuffix。
+    MaxRetainTables int
 
 
     // 是否自动创建表
@@ -164,6 +171,20 @@ type ShardingConfig struct {
 ```
 
 `TablePrefix` 由业务侧显式配置。它必须与模型 `TableName()` 返回值一致；未实现 `TableName()` 时，填写 GORM 默认命名规则解析出的表名。每个逻辑表只能注册一次。
+
+`Location` 必须显式配置。插件会在表名生成、范围路由、最近周期扫描和自动清理前将时间转换到该时区；同一逻辑表的所有进程必须使用相同 `Location`。
+
+自定义分表策略必须实现以下接口；`ParseSuffix` 用于将已有真实分表后缀还原为周期开始时间，自动清理据此识别可删除的历史表。
+
+```go
+type ShardingStrategy interface {
+    Suffix(time.Time) string
+    Prev(time.Time) time.Time
+    ParseSuffix(suffix string, location *time.Location) (time.Time, bool)
+}
+```
+
+`MaxRetainTables` 按连续时间周期保留分表，而不是按实际已建表数量保留。它大于 `0` 时，插件只在创建当前周期的新分表成功后删除窗口外、可被当前策略识别的同前缀分表；外层事务内首次建表不执行删除，避免 MySQL `DROP TABLE` 隐式提交事务。自定义 `ShardingStrategy` 必须实现 `ParseSuffix`，将表后缀解析为所属周期的开始时间；无法解析的同前缀表不会被删除。启用自动清理时，`MaxRetainTables` 必须大于或等于 `MaxScanTables`。
 
 
 ---
@@ -182,8 +203,14 @@ plugin.Register(
         Strategy:
             MonthStrategy,
 
+        Location:
+            time.Local,
+
         MaxScanTables:
             10,
+
+        MaxRetainTables:
+            0,
 
         AutoCreateTable:
             true,
@@ -366,7 +393,7 @@ gorm_sharding.AutoMigrate(db, &User{})
 `gorm_sharding.AutoMigrate` 不接管 `db.AutoMigrate`，只迁移已注册且 `AutoMigrate` 配置为 `true` 的模型。插件自动：
 
 ```
-扫描最近 MaxScanTables 张分表
+扫描最近 MaxScanTables 个时间周期内存在的分表
 
 ↓
 
@@ -379,7 +406,7 @@ AutoMigrate(User{})
 
 结果：
 
-最近 MaxScanTables 张历史表增加字段。
+最近 MaxScanTables 个时间周期内存在的历史表增加字段。
 
 
 ---
@@ -536,7 +563,7 @@ MaxScanTables:10
 只扫描：
 
 ```
-最近10张表
+最近10个时间周期内存在的表
 ```
 
 
@@ -682,7 +709,7 @@ Updates(...)
 扫描：
 
 ```
-最近MaxScanTables张表
+最近MaxScanTables个时间周期内存在的表
 ```
 
 
@@ -801,7 +828,7 @@ Raw 写操作只支持单模型、单逻辑表。`UPDATE ... JOIN`、多表 `DEL
 
 事务内首次插入新分表时，插件使用初始化时保存的非事务连接执行建表，再回到原事务执行插入。MySQL DDL 创建的空表会保留，但原事务 Rollback 会正常回滚业务数据。
 
-Raw 写操作未包含可识别分表字段时，只扫描最近 `MaxScanTables` 张真实分表，不保证覆盖全部历史分表；需要处理完整历史数据时必须提供可识别的分表字段时间条件。
+Raw 写操作未包含可识别分表字段时，只扫描最近 `MaxScanTables` 个时间周期内存在的真实分表，不保证覆盖全部历史分表；中间周期未建表时不会向更早周期补足扫描数量。需要处理完整历史数据时必须提供可识别的分表字段时间条件。
 
 Raw `INSERT` 到逻辑分表名不支持，因为当前 Raw 路径不解析 `VALUES` 中的分表字段；应使用 `Create`。
 
@@ -999,7 +1026,7 @@ utils/
 ## SELECT
 
 - 精确条件只查目标表
-- 无条件最多扫描N张表
+- 无条件最多扫描最近 N 个时间周期内存在的表
 - 多表结果正常返回
 
 
@@ -1017,7 +1044,7 @@ utils/
 
 ## AutoMigrate
 
-- 新字段同步最近 `MaxScanTables` 张已存在历史分表
+- 新字段同步最近 `MaxScanTables` 个时间周期内存在的历史分表
 - 新表自动拥有最新结构
 
 

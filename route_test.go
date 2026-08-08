@@ -11,6 +11,7 @@ import (
 func TestRouteExtractsTablesFromCommonWhereForms(t *testing.T) {
 	cfg := ShardingConfig{
 		Strategy:      DayStrategy,
+		Location:      time.Local,
 		MaxScanTables: 10,
 		TablePrefix:   "user",
 	}

@@ -675,7 +675,7 @@ func (p *Plugin) executeEmptyRowRead(db *gorm.DB, cfg ShardingConfig) error {
 
 	// Rows() 会把 *sql.Rows 交给调用方，Columns() 必须与原始 SELECT 一致。
 	// 因此不能使用虚拟 SELECT，而要在一张确认存在的真实分表执行原 WHERE 条件。
-	tables, err := p.manager.existingTables(db, cfg)
+	tables, err := p.manager.allExistingTables(db, cfg)
 	if err != nil {
 		return fmt.Errorf("gorm_sharding: find existing shard for empty Rows: %w", err)
 	}

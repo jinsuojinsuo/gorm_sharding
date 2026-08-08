@@ -515,6 +515,118 @@ func TestRequirementBoundaryRefreshesTableListCache(t *testing.T) {
 	}
 }
 
+// TestRequirementAutoCleanupKeepsTimeWindow 验证自动清理按连续时间周期保留分表，而不是按已建表数量保留。
+func TestRequirementAutoCleanupKeepsTimeWindow(t *testing.T) {
+	prefix := requirementUser{}.TableName() + "_retain"
+	rawDB := openRequirementDB(t)
+	defer closeRequirementDB(t, rawDB)
+	cleanupRequirementPrefix(t, rawDB, prefix)
+	defer cleanupRequirementPrefix(t, rawDB, prefix)
+
+	cfg := ShardingConfig{
+		TablePrefix:     prefix,
+		ShardingKey:     "created_at",
+		Strategy:        DayStrategy,
+		Location:        time.Local,
+		MaxScanTables:   3,
+		MaxRetainTables: 3,
+	}
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.Local)
+	expired := cfg.tableName(now.AddDate(0, 0, -3))
+	keepOldest := cfg.tableName(now.AddDate(0, 0, -2))
+	keepMiddle := cfg.tableName(now.AddDate(0, 0, -1))
+	keepCurrent := cfg.tableName(now)
+	invalidDateName := prefix + "_20260799"
+	for _, table := range []string{expired, keepOldest, keepMiddle, keepCurrent, prefix + "_other", invalidDateName} {
+		if err := rawDB.Table(table).AutoMigrate(&requirementUser{}); err != nil {
+			t.Fatalf("create shard %s failed: %v", table, err)
+		}
+	}
+
+	manager := newTableManager(rawDB)
+	if err := manager.cleanupExpiredTables(rawDB, cfg, now); err != nil {
+		t.Fatalf("automatic cleanup failed: %v", err)
+	}
+	if tableExists(t, rawDB, expired) {
+		t.Fatalf("expired shard %s still exists", expired)
+	}
+	for _, table := range []string{keepOldest, keepMiddle, keepCurrent, prefix + "_other", invalidDateName} {
+		if !tableExists(t, rawDB, table) {
+			t.Fatalf("table %s was removed unexpectedly", table)
+		}
+	}
+}
+
+// TestRequirementAutoCleanupSupportsCustomStrategy 验证自定义策略通过 ParseSuffix 删除保留窗口外分表。
+func TestRequirementAutoCleanupSupportsCustomStrategy(t *testing.T) {
+	prefix := requirementUser{}.TableName() + "_custom_retain"
+	rawDB := openRequirementDB(t)
+	defer closeRequirementDB(t, rawDB)
+	cleanupRequirementPrefix(t, rawDB, prefix)
+	defer cleanupRequirementPrefix(t, rawDB, prefix)
+
+	cfg := ShardingConfig{
+		TablePrefix:     prefix,
+		ShardingKey:     "created_at",
+		Strategy:        customTestStrategy{},
+		Location:        time.Local,
+		MaxScanTables:   2,
+		MaxRetainTables: 2,
+	}
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.Local)
+	expired := cfg.tableName(now.AddDate(0, 0, -2))
+	keepOldest := cfg.tableName(now.AddDate(0, 0, -1))
+	keepCurrent := cfg.tableName(now)
+	for _, table := range []string{expired, keepOldest, keepCurrent, prefix + "_unrecognized"} {
+		if err := rawDB.Table(table).AutoMigrate(&requirementUser{}); err != nil {
+			t.Fatalf("create shard %s failed: %v", table, err)
+		}
+	}
+
+	manager := newTableManager(rawDB)
+	if err := manager.cleanupExpiredTables(rawDB, cfg, now); err != nil {
+		t.Fatalf("custom strategy cleanup failed: %v", err)
+	}
+	if tableExists(t, rawDB, expired) {
+		t.Fatalf("expired custom shard %s still exists", expired)
+	}
+	for _, table := range []string{keepOldest, keepCurrent, prefix + "_unrecognized"} {
+		if !tableExists(t, rawDB, table) {
+			t.Fatalf("table %s was removed unexpectedly", table)
+		}
+	}
+}
+
+// TestRequirementMaxScanTablesUsesTimeWindow 验证缺失中间周期时不会向更早的已建表补足扫描数量。
+func TestRequirementMaxScanTablesUsesTimeWindow(t *testing.T) {
+	prefix := requirementUser{}.TableName() + "_scan_window"
+	rawDB := openRequirementDB(t)
+	defer closeRequirementDB(t, rawDB)
+	cleanupRequirementPrefix(t, rawDB, prefix)
+	defer cleanupRequirementPrefix(t, rawDB, prefix)
+
+	cfg := ShardingConfig{
+		TablePrefix:   prefix,
+		ShardingKey:   "created_at",
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 3,
+	}
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.Local)
+	current := cfg.tableName(now)
+	tooOld := cfg.tableName(now.AddDate(0, 0, -3))
+	for _, table := range []string{current, tooOld} {
+		if err := rawDB.Table(table).AutoMigrate(&requirementUser{}); err != nil {
+			t.Fatalf("create shard %s failed: %v", table, err)
+		}
+	}
+
+	tables := newTableManager(rawDB).tables(rawDB, cfg, now)
+	if !sameStrings(tables, []string{current}) {
+		t.Fatalf("scan tables = %v, want only current time-window table %s", tables, current)
+	}
+}
+
 // TestRequirementCreateNewShardInsideTransaction 验证事务内首次建表不会提交业务写入。
 func TestRequirementCreateNewShardInsideTransaction(t *testing.T) {
 	prefix := requirementUser{}.TableName()
@@ -609,6 +721,7 @@ func TestRequirementRejectsDuplicateInitialize(t *testing.T) {
 		TablePrefix:     requirementUser{}.TableName(),
 		ShardingKey:     "created_at",
 		Strategy:        HourStrategy,
+		Location:        time.Local,
 		MaxScanTables:   3,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -645,6 +758,7 @@ func TestRequirementPluginAutoMigrateSyncsHistoricalTables(t *testing.T) {
 		TablePrefix:     requirementUserV2{}.TableName(),
 		ShardingKey:     "created_at",
 		Strategy:        MonthStrategy,
+		Location:        time.Local,
 		MaxScanTables:   5,
 		AutoCreateTable: true,
 		AutoMigrate:     true,
@@ -678,6 +792,7 @@ func newRequirementShardedDB(t *testing.T, prefix string, strategy ShardingStrat
 		TablePrefix:     prefix,
 		ShardingKey:     "created_at",
 		Strategy:        strategy,
+		Location:        time.Local,
 		MaxScanTables:   maxScanTables,
 		AutoCreateTable: true,
 		AutoMigrate:     true,

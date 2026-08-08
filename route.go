@@ -548,7 +548,7 @@ func columnCandidates(key string) []string {
 
 // tablesForRangeBounds 根据时间范围倒推出最多 MaxScanTables 张真实分表。
 func tablesForRangeBounds(cfg ShardingConfig, bounds timeRangeBounds) []string {
-	start, end := bounds.start, bounds.end
+	start, end := cfg.shardTime(bounds.start), cfg.shardTime(bounds.end)
 	if end.Before(start) || (end.Equal(start) && (bounds.startExclusive || bounds.endExclusive)) {
 		// 原始 WHERE 条件必定为空集，不能交换边界后扫描无关的历史分表。
 		return nil

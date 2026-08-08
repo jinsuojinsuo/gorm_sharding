@@ -172,6 +172,7 @@ func TestRegisterRejectsAfterInitialize(t *testing.T) {
 		TablePrefix:   requirementUser{}.TableName(),
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
+		Location:      time.Local,
 		MaxScanTables: 1,
 	}); err == nil {
 		t.Fatal("Register after initialization returned nil error")
@@ -185,6 +186,7 @@ func TestAutoMigrateRequiresInitialize(t *testing.T) {
 		TablePrefix:   requirementUser{}.TableName(),
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
+		Location:      time.Local,
 		MaxScanTables: 1,
 		AutoMigrate:   true,
 	}); err != nil {
@@ -831,6 +833,7 @@ func TestRegisterRejectsDuplicateTablePrefix(t *testing.T) {
 		TablePrefix:   revisionDuplicateUser{}.TableName(),
 		ShardingKey:   "created_at",
 		Strategy:      DayStrategy,
+		Location:      time.Local,
 		MaxScanTables: 1,
 	}
 	if err := plugin.Register(cfg); err != nil {
@@ -848,6 +851,7 @@ func TestConfigForRejectsGoFieldNameAsShardingKey(t *testing.T) {
 		TablePrefix:   revisionDistinctUser{}.TableName(),
 		ShardingKey:   "CreatedAt",
 		Strategy:      DayStrategy,
+		Location:      time.Local,
 		MaxScanTables: 1,
 	}); err != nil {
 		t.Fatalf("register model: %v", err)

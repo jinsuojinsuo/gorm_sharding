@@ -22,7 +22,7 @@ type tableManager struct {
 	// seen 缓存已经确认存在的真实分表，避免循环内重复 HasTable。
 	seen sync.Map
 
-	// tableLists 缓存“最近 N 张表”的查询结果；缓存键包含当前分片，跨分片时间后会自动失效。
+	// tableLists 缓存“最近 N 个周期内存在的表”的查询结果；缓存键包含当前分片，跨分片时间后会自动失效。
 	tableLists sync.Map
 
 	// createGroup 合并同一真实分表的并发建表请求，避免切表瞬间重复 AutoMigrate。
@@ -110,9 +110,82 @@ func (m *tableManager) ensure(db *gorm.DB, model interface{}, cfg ShardingConfig
 		}
 		m.seen.Store(table, struct{}{})
 		m.clearTableListCache(cfg)
+		// 只在当前周期首次建表后清理。补写历史数据时不能以历史时间为窗口锚点删除较新分表。
+		now := cfg.shardTime(time.Now())
+		if !hasActiveTransaction(db) && cfg.MaxRetainTables > 0 && table == cfg.tableName(now) {
+			if err := m.cleanupExpiredTables(createDB, cfg, now); err != nil {
+				return nil, err
+			}
+		}
 		return nil, nil
 	})
 	return err
+}
+
+// cleanupExpiredTables 删除当前保留窗口之前、能被当前策略识别的真实分表。
+// now 作为窗口锚点，保留当前周期和此前连续 MaxRetainTables-1 个周期。
+func (m *tableManager) cleanupExpiredTables(db *gorm.DB, cfg ShardingConfig, now time.Time) error {
+	if cfg.MaxRetainTables <= 0 {
+		return nil
+	}
+
+	cutoff := cfg.shardTime(now)
+	for i := 1; i < cfg.MaxRetainTables; i++ {
+		cutoff = cfg.Strategy.Prev(cutoff)
+	}
+	cutoffStart, ok := cfg.Strategy.ParseSuffix(cfg.Strategy.Suffix(cutoff), cfg.Location)
+	if !ok {
+		return fmt.Errorf("gorm_sharding: strategy cannot parse retention cutoff")
+	}
+	tables, err := m.allExistingTables(db, cfg)
+	if err != nil {
+		return err
+	}
+	for _, table := range tables {
+		periodStart, matches := shardPeriodStart(cfg, table)
+		if !matches || !periodStart.Before(cutoffStart) {
+			continue
+		}
+		// 表名来自 information_schema 且已严格校验固定格式，仍使用反引号转义防止标识符注入。
+		if err := db.Session(&gorm.Session{NewDB: true}).Set(skipKey, true).
+			Exec("DROP TABLE IF EXISTS " + quoteMySQLIdentifier(table)).Error; err != nil {
+			return err
+		}
+		m.seen.Delete(table)
+	}
+	m.clearTableListCache(cfg)
+	return nil
+}
+
+// allExistingTables 查询指定逻辑表前缀下的全部候选真实分表，供自动清理使用。
+func (m *tableManager) allExistingTables(db *gorm.DB, cfg ShardingConfig) ([]string, error) {
+	if db.Dialector.Name() != "mysql" {
+		return nil, fmt.Errorf("gorm_sharding: only mysql table scan is supported")
+	}
+
+	var tables []string
+	metadataDB := db.Session(&gorm.Session{NewDB: true})
+	metadataDB.Error = nil
+	err := metadataDB.Raw(
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\'",
+		tableNameLikePattern(cfg.TablePrefix),
+	).Scan(&tables).Error
+	return tables, err
+}
+
+// shardPeriodStart 将真实表名解析为当前策略所属周期的开始时间。
+func shardPeriodStart(cfg ShardingConfig, table string) (time.Time, bool) {
+	prefix := cfg.TablePrefix + "_"
+	if !strings.HasPrefix(table, prefix) {
+		return time.Time{}, false
+	}
+	suffix := strings.TrimPrefix(table, prefix)
+	return cfg.Strategy.ParseSuffix(suffix, cfg.Location)
+}
+
+// quoteMySQLIdentifier 返回 MySQL 反引号转义后的标识符。
+func quoteMySQLIdentifier(identifier string) string {
+	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
 }
 
 // tables 返回无精确分表条件时需要扫描的最近分表列表。
@@ -122,22 +195,14 @@ func (m *tableManager) tables(db *gorm.DB, cfg ShardingConfig, now time.Time) []
 		return cloneStrings(cached.([]string))
 	}
 
-	tables, err := m.existingTables(db, cfg)
-	if err == nil && len(tables) > 0 {
-		if len(tables) > cfg.MaxScanTables {
-			tables = tables[:cfg.MaxScanTables]
-		}
+	tables, err := m.existingTables(db, cfg, now)
+	if err == nil {
 		m.tableLists.Store(cacheKey, cloneStrings(tables))
 		return tables
 	}
 
-	// information_schema 不可用时退化为按当前时间倒推，仍然受 MaxScanTables 限制。
-	out := make([]string, 0, cfg.MaxScanTables)
-	cursor := now
-	for i := 0; i < cfg.MaxScanTables; i++ {
-		out = append(out, cfg.tableName(cursor))
-		cursor = cfg.Strategy.Prev(cursor)
-	}
+	// information_schema 不可用时退化为最近 N 个时间周期的候选表名。
+	out := recentTableCandidates(cfg, now)
 	m.tableLists.Store(cacheKey, cloneStrings(out))
 	return out
 }
@@ -158,31 +223,64 @@ func (m *tableManager) clearTableListCache(cfg ShardingConfig) {
 	})
 }
 
-// existingTables 从 MySQL information_schema 查询已经存在的真实分表。
-func (m *tableManager) existingTables(db *gorm.DB, cfg ShardingConfig) ([]string, error) {
+// existingTables 返回最近 MaxScanTables 个时间周期内已经存在的真实分表。
+func (m *tableManager) existingTables(db *gorm.DB, cfg ShardingConfig, now time.Time) ([]string, error) {
 	if db.Dialector.Name() != "mysql" {
 		return nil, fmt.Errorf("gorm_sharding: only mysql table scan is supported")
 	}
 
-	var tables []string
-	// 按表名倒序取最近分表；当前策略的表名后缀都按时间递增，倒序就是从新到旧。
+	candidates := recentTableCandidates(cfg, now)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(candidates))
+	arguments := make([]interface{}, len(candidates))
+	for index, table := range candidates {
+		placeholders[index] = "?"
+		arguments[index] = table
+	}
+
+	var found []string
 	// 元数据查询不能复用当前业务 Statement：Raw(...).Scan(...) 会设置 Dest、Schema 和 SQL，
 	// 从而破坏调用方随后执行的分表查询。NewDB Session 使用独立 Statement 保留同一连接配置。
 	metadataDB := db.Session(&gorm.Session{NewDB: true})
 	// 当前调用可能正在从 1146 恢复，不能让历史错误阻止 information_schema 查询。
 	metadataDB.Error = nil
 	err := metadataDB.Raw(
-		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ESCAPE '\\\\' ORDER BY TABLE_NAME DESC LIMIT ?",
-		tableNameLikePattern(cfg.TablePrefix), cfg.MaxScanTables,
-	).Scan(&tables).Error
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ("+strings.Join(placeholders, ",")+")",
+		arguments...,
+	).Scan(&found).Error
 	if err != nil {
-		return tables, err
+		return nil, err
 	}
-	for _, table := range tables {
-		// existingTables 已经从 information_schema 拿到真实存在的表名，顺手写入缓存供后续扫描使用。
+	existing := make(map[string]struct{}, len(found))
+	for _, table := range found {
+		existing[table] = struct{}{}
 		m.seen.Store(table, struct{}{})
 	}
-	return tables, err
+	tables := make([]string, 0, len(found))
+	for _, table := range candidates {
+		if _, ok := existing[table]; ok {
+			tables = append(tables, table)
+		}
+	}
+	return tables, nil
+}
+
+// recentTableCandidates 按当前周期向前生成最多 MaxScanTables 个不同的真实分表名。
+func recentTableCandidates(cfg ShardingConfig, now time.Time) []string {
+	tables := make([]string, 0, cfg.MaxScanTables)
+	seen := make(map[string]struct{}, cfg.MaxScanTables)
+	cursor := cfg.shardTime(now)
+	for index := 0; index < cfg.MaxScanTables; index++ {
+		table := cfg.tableName(cursor)
+		if _, ok := seen[table]; !ok {
+			tables = append(tables, table)
+			seen[table] = struct{}{}
+		}
+		cursor = cfg.Strategy.Prev(cursor)
+	}
+	return tables
 }
 
 // tableNameLikePattern 转义逻辑表名里的 LIKE 通配符，并匹配其真实分表后缀。
@@ -196,7 +294,7 @@ func (m *tableManager) autoMigrate(db *gorm.DB, model interface{}, cfg ShardingC
 	if db == nil {
 		return fmt.Errorf("gorm_sharding: AutoMigrate database is nil")
 	}
-	tables, err := m.existingTables(db, cfg)
+	tables, err := m.existingTables(db, cfg, time.Now())
 	if err != nil {
 		return err
 	}

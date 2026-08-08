@@ -79,7 +79,15 @@ func (p *Plugin) buildCombinedQuery(db *gorm.DB, tables []string) (string, []int
 	dryRun.Statement.ReflectValue = db.Statement.ReflectValue
 	// 直接调用 gorm:query 会绕过 GORM processor；手动保留 Query 回调需要构建的子句顺序。
 	dryRun.Statement.BuildClauses = append([]string(nil), db.Callback().Query().Clauses...)
-	p.queryFn(dryRun)
+	queryFn := p.queryFn
+	if queryFn == nil {
+		// SQL 构建单元测试会直接调用本函数，尚未通过 db.Use 初始化插件回调。
+		queryFn = db.Callback().Query().Get("gorm:query")
+	}
+	if queryFn == nil {
+		return "", nil, fmt.Errorf("gorm_sharding: original gorm query callback is unavailable")
+	}
+	queryFn(dryRun)
 	if dryRun.Error != nil {
 		return "", nil, dryRun.Error
 	}

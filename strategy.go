@@ -23,7 +23,8 @@ func (s strategyFunc) Prev(t time.Time) time.Time {
 	return s.prev(t)
 }
 
-// ParseSuffix 将真实分表后缀解析为所属周期的开始时间。
+// ParseSuffix 将不包含表前缀的真实分表后缀解析为指定时区下的周期开始时间。
+// 例如 MonthStrategy 的 "202608" 会解析为 2026-08-01 00:00:00。
 func (s strategyFunc) ParseSuffix(suffix string, location *time.Location) (time.Time, bool) {
 	return s.parse(suffix, location)
 }

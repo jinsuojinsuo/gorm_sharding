@@ -12,8 +12,10 @@ type ShardingStrategy interface {
 	Suffix(time.Time) string
 	// Prev 返回当前时间所属分片的上一个分片时间，用于最近 N 个周期倒推扫描。
 	Prev(time.Time) time.Time
-	// ParseSuffix 将真实分表后缀解析为所属周期的开始时间，供自动清理识别历史分表。
-	// 无法识别或后缀无效时返回 false。
+	// ParseSuffix 将不包含 TablePrefix 的真实分表后缀解析为所属周期的开始时间。
+	// 返回时间必须使用传入 location，例如按月后缀 "202608" 应返回
+	// 2026-08-01 00:00:00，按日后缀 "20260804" 应返回 2026-08-04 00:00:00。
+	// 后缀不属于当前策略、格式或日期无效时返回 false；自动清理会保留无法解析的同前缀表。
 	ParseSuffix(suffix string, location *time.Location) (time.Time, bool)
 }
 

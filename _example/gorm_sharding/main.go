@@ -91,7 +91,7 @@ func main() {
 		panic(err)
 	}
 
-	if err := plugin.AutoMigrate(db, &User{}, &Order{}); err != nil {
+	if err := gorm_sharding.AutoMigrate(db, &User{}, &Order{}); err != nil {
 		panic(err)
 	}
 

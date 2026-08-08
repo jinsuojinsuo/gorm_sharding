@@ -12,7 +12,7 @@
 6. 单模型、单逻辑表的跨分表读取统一由 MySQL 合并真实分表原始行后执行，保持单表查询结果与 GORM 回调语义一致。
 7. Update/Delete 支持精确路由和最近 N 表扫描，并累加 `RowsAffected`；跨分表时不支持 `Limit`。
 8. 支持单表 Raw SQL，通过 Vitess `sqlparser` 做 AST 表名改写。
-9. 支持显式调用 `plugin.AutoMigrate(db, model)` 同步历史分表字段。
+9. 支持显式调用 `gorm_sharding.AutoMigrate(db, model)` 同步历史分表字段。
 10. 不创建逻辑模板表，例如只创建 `user_2026080417`，不创建 `user`。
 
 ## 安装
@@ -101,7 +101,7 @@ type ShardingConfig struct {
 	// 插入目标表不存在时是否自动建表。
 	AutoCreateTable bool
 
-	// 调用 plugin.AutoMigrate 时是否迁移该模型的历史分表。
+	// 调用 gorm_sharding.AutoMigrate 时是否迁移该模型的历史分表。
 	AutoMigrate bool
 }
 ```
@@ -325,7 +325,7 @@ Raw `SELECT` 只支持路由到一张真实分表；`IN`、范围等条件命中
 最近 `MaxScanTables` 张历史分表的字段同步使用插件提供的迁移方法：
 
 ```go
-if err := plugin.AutoMigrate(db, &User{}); err != nil {
+if err := gorm_sharding.AutoMigrate(db, &User{}); err != nil {
 	panic(err)
 }
 ```
@@ -383,7 +383,7 @@ go test ./... -run TestRequirement -count=1 -v
 6. 跨分表查询不支持 Join、`Preload`，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。
 8. Raw `SELECT` 只支持单个真实分表；Raw `UPDATE`、`DELETE` 支持多分表循环执行。复杂 Join 仍不支持。
 9. Raw SQL 的子查询可访问普通非分表表，但不能引用已注册的逻辑分表。跨分表普通 GORM 查询不支持任何子查询，包括相关子查询、`EXISTS` 和派生表；单分表 GORM 查询不受此限制。
-10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `plugin.AutoMigrate`。
+10. 不接管 `db.AutoMigrate`，历史分表迁移请使用 `gorm_sharding.AutoMigrate`。
 11. 事务内首次写入新分表时，插件会使用初始化时保存的非事务连接创建物理表，再回到原事务执行插入。因此业务 DML 可以正常回滚，但新建的空分表会保留。元数据读取仍继承当前调用的连接配置与 Context；为避免首次写入承受 DDL 延迟，建议提前预建下一周期分表。
 12. 分表字段不可更新。GORM `Update`、`Updates`、`Save` 和 Raw `UPDATE` 修改该字段会返回错误；需要调整分表时间时，请由业务显式执行“插入新分表并删除旧分表”。
 13. 普通 GORM 的 `Update`、`Updates`、`Delete` 若仅以主键定位记录且没有可识别的分表字段，会返回错误。分表间自增主键可能重复，单条写入应同时提供分表字段。
@@ -393,7 +393,7 @@ go test ./... -run TestRequirement -count=1 -v
 ## 性能说明
 
 1. `MaxScanTables` 控制最多扫描多少张分表，不代表最多执行多少次元数据查询。
-2. `plugin.AutoMigrate` 会对每张历史表执行 GORM 迁移检查，字段和索引越多，`information_schema` 查询越多。
+2. `gorm_sharding.AutoMigrate` 会对每张历史表执行 GORM 迁移检查，字段和索引越多，`information_schema` 查询越多。
 3. 最近表列表按当前分片缓存，切到新分片时缓存 key 会变化。
 4. 自动创建新分表后会清理最近表列表缓存，避免切表瞬间继续使用旧列表。
 5. 执行 SQL 前不会逐表检查是否存在；如果执行后遇到 MySQL `1146 Table doesn't exist`，会清理缓存并按表不存在处理。

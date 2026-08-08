@@ -359,11 +359,11 @@ Age int
 执行：
 
 ```go
-plugin.AutoMigrate(db, &User{})
+gorm_sharding.AutoMigrate(db, &User{})
 ```
 
 
-`plugin.AutoMigrate` 不接管 `db.AutoMigrate`，只迁移已注册且 `AutoMigrate` 配置为 `true` 的模型。插件自动：
+`gorm_sharding.AutoMigrate` 不接管 `db.AutoMigrate`，只迁移已注册且 `AutoMigrate` 配置为 `true` 的模型。插件自动：
 
 ```
 扫描最近 MaxScanTables 张分表

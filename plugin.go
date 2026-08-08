@@ -129,6 +129,19 @@ func (p *Plugin) AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	return nil
 }
 
+// AutoMigrate 迁移 db 已安装分表插件管理的历史真实分表。
+// 调用前必须先通过 db.Use(plugin) 安装插件；实例方法仍保留以兼容已有代码。
+func AutoMigrate(db *gorm.DB, models ...interface{}) error {
+	if db == nil || db.Config == nil {
+		return fmt.Errorf("gorm_sharding: database is nil")
+	}
+	plugin, ok := db.Config.Plugins[pluginName].(*Plugin)
+	if !ok || plugin == nil {
+		return fmt.Errorf("gorm_sharding: plugin is not installed on database")
+	}
+	return plugin.AutoMigrate(db, models...)
+}
+
 // configFor 根据当前 GORM Statement 找到模型对应的分表配置。
 func (p *Plugin) configFor(db *gorm.DB) (ShardingConfig, bool, error) {
 	if skipped, ok := db.Get(skipKey); ok && skipped == true {

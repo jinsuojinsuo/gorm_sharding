@@ -261,15 +261,7 @@ func likeRangeBoundsFromExprs(exprs []clause.Expression, cfg ShardingConfig, key
 	var bounds timeRangeBounds
 	found := false
 	for _, expression := range exprs {
-		expr, ok := expression.(clause.Expr)
-		if !ok {
-			continue
-		}
-		parsed, ok := parseConditionSQL(expr.SQL)
-		if !ok {
-			continue
-		}
-		parsedBounds, matched, err := likeRangeBoundsFromVitessExpr(parsed, expr.Vars, cfg, key)
+		parsedBounds, matched, err := likeRangeBoundsFromExpression(expression, cfg, key)
 		if err != nil {
 			return timeRangeBounds{}, false, err
 		}
@@ -284,6 +276,22 @@ func likeRangeBoundsFromExprs(exprs []clause.Expression, cfg ShardingConfig, key
 		}
 	}
 	return bounds, found, nil
+}
+
+// likeRangeBoundsFromExpression 读取单个 GORM 条件中的 LIKE 前缀范围。
+// OR 和 NOT 分支无法安全缩窄到单一 LIKE 范围，因此交给调用方按最近周期扫描。
+func likeRangeBoundsFromExpression(expr clause.Expression, cfg ShardingConfig, key string) (timeRangeBounds, bool, error) {
+	switch condition := expr.(type) {
+	case clause.Expr:
+		parsed, ok := parseConditionSQL(condition.SQL)
+		if !ok {
+			return timeRangeBounds{}, false, nil
+		}
+		return likeRangeBoundsFromVitessExpr(parsed, condition.Vars, cfg, key)
+	case clause.AndConditions:
+		return likeRangeBoundsFromExprs(condition.Exprs, cfg, key)
+	}
+	return timeRangeBounds{}, false, nil
 }
 
 // timeFromReflect 从模型值里读取分表字段时间。

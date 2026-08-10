@@ -70,7 +70,7 @@ func main() {
 		ShardingKey:     "created_at",               //分表字段
 		Strategy:        gorm_sharding.HourStrategy, //按小时分表
 		Location:        time.Local,                 //固定分表时区
-		MaxScanTables:   3,                          //最大扫描10张表
+		MaxScanTables:   3,                          //最多扫描最近3个小时分表
 		AutoCreateTable: true,                       //自动创建表
 		AutoMigrate:     true,                       //自动迁移表
 	}); err != nil {
@@ -81,7 +81,7 @@ func main() {
 		ShardingKey:     "created_at",                //分表字段
 		Strategy:        gorm_sharding.MonthStrategy, //订单表按月分表
 		Location:        time.Local,                  //固定分表时区
-		MaxScanTables:   2,                           //无分表条件时最多扫描最近6张订单分表
+		MaxScanTables:   2,                           //无分表条件时最多扫描最近2张订单分表
 		AutoCreateTable: true,                        //插入订单时自动创建目标分表
 		AutoMigrate:     true,                        //调用 plugin.AutoMigrate 时迁移订单历史分表
 	}); err != nil {

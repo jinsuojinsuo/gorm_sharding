@@ -491,3 +491,25 @@ func TestRawRouteFallsBackForNotShardingTimeCondition(t *testing.T) {
 		t.Fatalf("vars[0] = %T, want time.Time", vars[0])
 	}
 }
+
+func TestRouteIntersectsNestedClauseLikeAndRange(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	exprs := []clause.Expression{clause.AndConditions{Exprs: []clause.Expression{
+		clause.Expr{SQL: "created_at LIKE ?", Vars: []interface{}{"2026-08-01%"}},
+		clause.Gte{Column: "created_at", Value: "2026/08/01"},
+		clause.Lt{Column: "created_at", Value: "2026/09/01"},
+	}}}
+
+	tables, routed, err := tablesFromExprs(exprs, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs() error = %v", err)
+	}
+	if !routed || !sameStrings(tables, []string{"user_20260801"}) {
+		t.Fatalf("tables = %v, routed = %v; want user_20260801", tables, routed)
+	}
+}

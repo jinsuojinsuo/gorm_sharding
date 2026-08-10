@@ -639,7 +639,8 @@ func rawStatementTables(stmt sqlparser.Statement, vars []interface{}, cfg Shardi
 	return nil, false, nil
 }
 
-// timeValuesFromVitessExpr 提取 AND/OR 组合中的精确分表时间；OR 的每一支都必须可精确路由。
+// timeValuesFromVitessExpr 提取 AND/OR 组合中的精确分表时间。
+// OR 任一分支无法化为精确时间时，调用方会按最近周期扫描；参数校验已由预处理完成。
 func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
 	switch e := expr.(type) {
 	case *sqlparser.AndExpr:
@@ -665,9 +666,6 @@ func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg Shard
 			return nil, false, err
 		}
 		if !leftOK || !rightOK {
-			if vitessExprReferencesColumn(expr, key) {
-				return nil, false, fmt.Errorf("gorm_sharding: unsupported sharding time expression")
-			}
 			return nil, false, nil
 		}
 		return append(left, right...), true, nil

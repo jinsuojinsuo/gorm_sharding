@@ -275,3 +275,68 @@ func TestRawRouteIntersectsLikeAndRange(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteFallsBackForMixedOrTimeConditions(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+
+	expr := clause.Expr{
+		SQL: "created_at = ? OR (created_at >= ? AND created_at < ?)",
+		Vars: []interface{}{
+			time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local),
+			"2026/08/02",
+			"2026/08/03",
+		},
+	}
+
+	_, routed, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs() error = %v", err)
+	}
+	if routed {
+		t.Fatal("tablesFromExprs() routed mixed OR condition, want fallback")
+	}
+	for _, index := range []int{1, 2} {
+		if _, ok := expr.Vars[index].(time.Time); !ok {
+			t.Fatalf("expr.Vars[%d] = %T, want time.Time", index, expr.Vars[index])
+		}
+	}
+}
+
+func TestRawRouteFallsBackForMixedOrTimeConditions(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"SELECT * FROM user WHERE created_at = ? OR (created_at >= ? AND created_at < ?)",
+	)
+	if err != nil {
+		t.Fatalf("parse statement: %v", err)
+	}
+	vars := []interface{}{
+		time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local),
+		"2026/08/02",
+		"2026/08/03",
+	}
+
+	_, routed, err := rawStatementTables(stmt, vars, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("rawStatementTables() error = %v", err)
+	}
+	if routed {
+		t.Fatal("rawStatementTables() routed mixed OR condition, want fallback")
+	}
+	for _, index := range []int{1, 2} {
+		if _, ok := vars[index].(time.Time); !ok {
+			t.Fatalf("vars[%d] = %T, want time.Time", index, vars[index])
+		}
+	}
+}

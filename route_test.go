@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gorm.io/gorm/clause"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // TestRouteExtractsTablesFromCommonWhereForms 验证常见 GORM where 写法都能路由到明确分表。
@@ -154,5 +155,123 @@ func TestRouteRejectsUnsupportedShardingTimeInputs(t *testing.T) {
 				t.Fatal("tablesFromExprs returned nil error")
 			}
 		})
+	}
+}
+
+// TestRouteNormalizesAllShardingTimeConditions 验证精确路由不能跳过后续分表字段参数归一化。
+func TestRouteNormalizesAllShardingTimeConditions(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	createdAt := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	expr := clause.Expr{
+		SQL:  "created_at = ? AND created_at >= ?",
+		Vars: []interface{}{createdAt, "2026/08/04"},
+	}
+
+	tables, routed, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
+	if !routed || !sameStrings(tables, []string{"user_20260804"}) {
+		t.Fatalf("tables = %v, routed = %v", tables, routed)
+	}
+	if _, ok := expr.Vars[1].(time.Time); !ok {
+		t.Fatalf("range var type = %T, want time.Time", expr.Vars[1])
+	}
+}
+
+// TestRouteRejectsInvalidShardingTimeAfterLike 验证 LIKE 路由不能跳过后续非法分表字段条件。
+func TestRouteRejectsInvalidShardingTimeAfterLike(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+
+	if _, _, err := tablesFromExprs([]clause.Expression{clause.Expr{
+		SQL:  "created_at LIKE ? AND created_at = ?",
+		Vars: []interface{}{"2026-08%", "not-a-time"},
+	}}, cfg, "created_at"); err == nil {
+		t.Fatal("tablesFromExprs returned nil error")
+	}
+}
+
+// TestRouteFallsBackAfterNormalizingSingleBound 验证合法但无法形成完整范围的条件扫描最近分表。
+func TestRouteFallsBackAfterNormalizingSingleBound(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	expr := clause.Expr{SQL: "created_at >= ?", Vars: []interface{}{"2026/08/04"}}
+
+	if _, routed, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at"); err != nil || routed {
+		t.Fatalf("tablesFromExprs routed = %v, err = %v; want fallback", routed, err)
+	}
+	if _, ok := expr.Vars[0].(time.Time); !ok {
+		t.Fatalf("range var type = %T, want time.Time", expr.Vars[0])
+	}
+}
+
+// TestRouteIntersectsLikeAndRange 验证 LIKE 前缀范围会与显式上下界按 AND 语义取交集。
+func TestRouteIntersectsLikeAndRange(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	expr := clause.Expr{
+		SQL:  "created_at >= ? AND created_at < ? AND created_at LIKE ?",
+		Vars: []interface{}{"2026/08/02", "2026/08/03", "2026-08%"},
+	}
+
+	tables, routed, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs error = %v", err)
+	}
+	if !routed || !sameStrings(tables, []string{"user_20260802"}) {
+		t.Fatalf("tables = %v, routed = %v", tables, routed)
+	}
+	for _, index := range []int{0, 1} {
+		if _, ok := expr.Vars[index].(time.Time); !ok {
+			t.Fatalf("range var %d type = %T, want time.Time", index, expr.Vars[index])
+		}
+	}
+}
+
+// TestRawRouteIntersectsLikeAndRange 验证 Raw SQL 与 GORM 条件使用相同的范围交集路由。
+func TestRawRouteIntersectsLikeAndRange(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"SELECT * FROM user WHERE created_at >= ? AND created_at < ? AND created_at LIKE ?",
+	)
+	if err != nil {
+		t.Fatalf("parse raw SQL: %v", err)
+	}
+	vars := []interface{}{"2026/08/02", "2026/08/03", "2026-08%"}
+
+	tables, routed, err := rawStatementTables(stmt, vars, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("rawStatementTables error = %v", err)
+	}
+	if !routed || !sameStrings(tables, []string{"user_20260802"}) {
+		t.Fatalf("tables = %v, routed = %v", tables, routed)
+	}
+	for _, index := range []int{0, 1} {
+		if _, ok := vars[index].(time.Time); !ok {
+			t.Fatalf("range var %d type = %T, want time.Time", index, vars[index])
+		}
 	}
 }

@@ -294,7 +294,11 @@ db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
 
 如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 个时间周期内存在的真实分表；中间周期未建表时，不会向更早周期补足扫描数量。
 
+所有 `ShardingKey` 条件都会先按 `Location` 归一化并校验，即使另一个条件已经足以精确路由。非法时间字符串、SQL 内联日期字面量和无法解释的分表字段表达式会直接返回错误。时间值合法但组合条件无法推导出完整有限范围时，插件扫描最近 `MaxScanTables` 个周期内存在的表；该降级策略不保证覆盖全部历史数据。
+
 多个范围条件会按 `AND` 交集计算：下界取较晚时间，上界取较早时间；不会因范围分别写在多次 `Where` 调用中而退化为最近表扫描。
+
+连续日期 `LIKE` 前缀同样会转换为半开时间范围，并与同一 `AND` 条件中的等值、`IN`、上下界取交集后路由。
 
 当范围交集为空，例如 `created_at >= start AND created_at < end` 且 `start >= end` 时，插件直接返回空结果，`Update` 和 `Delete` 的 `RowsAffected` 为 `0`，不会扫描任何真实分表。
 

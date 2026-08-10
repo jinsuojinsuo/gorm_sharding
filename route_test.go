@@ -340,3 +340,154 @@ func TestRawRouteFallsBackForMixedOrTimeConditions(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteIntersectsExactTimeConditions(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	first := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
+	second := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+
+	cases := []struct {
+		name  string
+		exprs []clause.Expression
+		want  []string
+	}{
+		{
+			name: "conflicting string equalities",
+			exprs: []clause.Expression{clause.Expr{
+				SQL:  "created_at = ? AND created_at = ?",
+				Vars: []interface{}{first, second},
+			}},
+		},
+		{
+			name: "conflicting clause equalities",
+			exprs: []clause.Expression{
+				clause.Eq{Column: "created_at", Value: first},
+				clause.Eq{Column: "created_at", Value: second},
+			},
+		},
+		{
+			name: "string in and equality",
+			exprs: []clause.Expression{clause.Expr{
+				SQL:  "created_at IN (?, ?) AND created_at = ?",
+				Vars: []interface{}{first, second, second},
+			}},
+			want: []string{"user_20260802"},
+		},
+		{
+			name: "clause in and equality",
+			exprs: []clause.Expression{
+				clause.IN{Column: "created_at", Values: []interface{}{first, second}},
+				clause.Eq{Column: "created_at", Value: second},
+			},
+			want: []string{"user_20260802"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			tables, routed, err := tablesFromExprs(tt.exprs, cfg, "created_at")
+			if err != nil {
+				t.Fatalf("tablesFromExprs() error = %v", err)
+			}
+			if !routed || !sameStrings(tables, tt.want) {
+				t.Fatalf("tables = %v, routed = %v; want %v", tables, routed, tt.want)
+			}
+		})
+	}
+}
+
+func TestRawRouteIntersectsExactTimeConditions(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	first := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
+	second := time.Date(2026, 8, 2, 10, 0, 0, 0, time.Local)
+	cases := []struct {
+		name string
+		sql  string
+		vars []interface{}
+		want []string
+	}{
+		{
+			name: "conflicting equalities",
+			sql:  "SELECT * FROM user WHERE created_at = ? AND created_at = ?",
+			vars: []interface{}{first, second},
+		},
+		{
+			name: "in and equality",
+			sql:  "SELECT * FROM user WHERE created_at IN (?, ?) AND created_at = ?",
+			vars: []interface{}{first, second, second},
+			want: []string{"user_20260802"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := sqlparser.NewTestParser().Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("parse statement: %v", err)
+			}
+			tables, routed, err := rawStatementTables(stmt, tt.vars, cfg, "created_at")
+			if err != nil {
+				t.Fatalf("rawStatementTables() error = %v", err)
+			}
+			if !routed || !sameStrings(tables, tt.want) {
+				t.Fatalf("tables = %v, routed = %v; want %v", tables, routed, tt.want)
+			}
+		})
+	}
+}
+
+func TestRouteFallsBackForNotShardingTimeCondition(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	expr := clause.Expr{SQL: "NOT created_at = ?", Vars: []interface{}{"2026/08/04"}}
+
+	_, routed, err := tablesFromExprs([]clause.Expression{expr}, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("tablesFromExprs() error = %v", err)
+	}
+	if routed {
+		t.Fatal("tablesFromExprs() routed NOT condition, want fallback")
+	}
+	if _, ok := expr.Vars[0].(time.Time); !ok {
+		t.Fatalf("expr.Vars[0] = %T, want time.Time", expr.Vars[0])
+	}
+}
+
+func TestRawRouteFallsBackForNotShardingTimeCondition(t *testing.T) {
+	cfg := ShardingConfig{
+		Strategy:      DayStrategy,
+		Location:      time.Local,
+		MaxScanTables: 10,
+		TablePrefix:   "user",
+	}
+	stmt, err := sqlparser.NewTestParser().Parse("SELECT * FROM user WHERE NOT created_at = ?")
+	if err != nil {
+		t.Fatalf("parse statement: %v", err)
+	}
+	vars := []interface{}{"2026/08/04"}
+
+	_, routed, err := rawStatementTables(stmt, vars, cfg, "created_at")
+	if err != nil {
+		t.Fatalf("rawStatementTables() error = %v", err)
+	}
+	if routed {
+		t.Fatal("rawStatementTables() routed NOT condition, want fallback")
+	}
+	if _, ok := vars[0].(time.Time); !ok {
+		t.Fatalf("vars[0] = %T, want time.Time", vars[0])
+	}
+}

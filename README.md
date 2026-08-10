@@ -292,6 +292,10 @@ db.Where(clause.Gte{Column: "created_at", Value: start}).
 db.Where(clause.IN{Column: "created_at", Values: []interface{}{t1, t2}})
 ```
 
+分表字段模型值仍必须是 `time.Time`。`Where`、`clause` 和 Raw SQL 的 `ShardingKey` 绑定参数支持 `time.Time`、RFC3339 字符串，以及 `2006-01-02`、`2006/01/02`、`2006-01-02 15:04:05`、`2006/01/02 15:04:05`、`2006-01-02T15:04:05`。无时区字符串按 `Location` 解释；RFC3339 字符串按自身偏移量解析后转换到 `Location`。
+
+`LIKE` 仅支持连续日期前缀：`2026%`、`2026-08%`、`2026-08-04%`、`2026-08-04 10%`。其他通配形式、SQL 内联日期字面量和无法解释的分表字段表达式会返回错误。
+
 如果条件里无法解析出分表字段，插件会退化为扫描最近 `MaxScanTables` 个时间周期内存在的真实分表；中间周期未建表时，不会向更早周期补足扫描数量。
 
 所有 `ShardingKey` 条件都会先按 `Location` 归一化并校验，即使另一个条件已经足以精确路由。非法时间字符串、SQL 内联日期字面量和无法解释的分表字段表达式会直接返回错误。时间值合法但组合条件无法推导出完整有限范围时，插件扫描最近 `MaxScanTables` 个周期内存在的表；该降级策略不保证覆盖全部历史数据。
@@ -404,8 +408,8 @@ go test ./... -run TestRequirement -count=1 -v
 ## 已知限制
 
 1. 第一版只支持 MySQL。
-2. 分表字段只支持 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`。
-3. 不支持 int 时间戳、字符串日期、SQL 表达式计算分表字段。
+2. 分表字段模型值必须是 `time.Time`，数据库字段建议使用 `DATETIME` 或 `TIMESTAMP`；查询绑定参数支持本文列出的日期字符串。
+3. 不支持 int 时间戳、SQL 内联日期字面量和无法解释的 SQL 表达式计算分表字段。
 4. 跨分表 Join 不支持。
 5. 单模型、单逻辑表的跨分表 `Order`、`Offset`、`Limit`、`Distinct`、聚合、`Group By`、`Having` 已支持：由 MySQL 在合并后的原始行集上统一执行，以保持单表 SQL 语义。为减少每张表读取量，明细分页会在每张分表先执行相同排序并取 `offset + limit` 行；`FOR UPDATE`、`FOR SHARE` 等锁定查询不支持跨分表，会返回 `gorm_sharding: locking across shards is not supported`。
 6. 跨分表查询不支持 Join、`Preload`，也不支持在 `Group`、`Order`、`Select`、`Having` 中手写逻辑表限定名，例如 `user.score`；应使用 `score`。

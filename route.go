@@ -217,6 +217,8 @@ func normalizeVitessShardingExpr(expr sqlparser.Expr, vars []interface{}, cfg Sh
 			return err
 		}
 		return normalizeVitessShardingExpr(node.Right, vars, cfg, key)
+	case *sqlparser.NotExpr:
+		return normalizeVitessShardingExpr(node.Expr, vars, cfg, key)
 	case *sqlparser.BetweenExpr:
 		if !vitessColumnMatches(node.Left, key) {
 			break
@@ -345,17 +347,18 @@ func timeFromExprs(exprs []clause.Expression, key string) (time.Time, bool) {
 
 // timeValuesFromExprs 从 GORM where 表达式中提取精确时间值，支持 Eq、IN 和 OR 等值条件。
 func timeValuesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
-	out := make([]time.Time, 0)
+	var out []time.Time
+	found := false
 	for index, expr := range exprs {
+		var values []time.Time
+		matched := false
 		switch e := expr.(type) {
 		case clause.Expr:
-			values, ok, err := timeValuesFromSQLExpr(e.SQL, e.Vars, cfg, key)
+			parsedValues, ok, err := timeValuesFromSQLExpr(e.SQL, e.Vars, cfg, key)
 			if err != nil {
 				return nil, false, err
 			}
-			if ok {
-				out = append(out, values...)
-			}
+			values, matched = parsedValues, ok
 		case clause.Eq:
 			if columnMatches(e.Column, key) {
 				value, err := normalizeShardingClauseValue(e.Value, cfg.Location)
@@ -364,11 +367,11 @@ func timeValuesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key stri
 				}
 				e.Value = value
 				exprs[index] = e
-				out = append(out, value)
+				values, matched = []time.Time{value}, true
 			}
 		case clause.IN:
 			if columnMatches(e.Column, key) {
-				values, normalized, err := normalizeShardingClauseValues(e.Values, cfg.Location)
+				parsedValues, normalized, err := normalizeShardingClauseValues(e.Values, cfg.Location)
 				if err != nil {
 					return nil, false, err
 				}
@@ -378,30 +381,59 @@ func timeValuesFromExprs(exprs []clause.Expression, cfg ShardingConfig, key stri
 				}
 				e.Values = normalizedValues
 				exprs[index] = e
-				out = append(out, values...)
+				values, matched = parsedValues, true
 			}
 		case clause.AndConditions:
-			values, ok, err := timeValuesFromExprs(e.Exprs, cfg, key)
+			parsedValues, ok, err := timeValuesFromExprs(e.Exprs, cfg, key)
 			if err != nil {
 				return nil, false, err
 			}
 			if ok {
 				e.Exprs = e.Exprs
 				exprs[index] = e
-				out = append(out, values...)
+				values, matched = parsedValues, true
 			}
 		case clause.OrConditions:
-			values, ok, err := timeValuesFromExprs(e.Exprs, cfg, key)
+			parsedValues, ok, err := timeValuesFromOrExprs(e.Exprs, cfg, key)
 			if err != nil || !ok {
 				return nil, false, err
 			}
 			e.Exprs = e.Exprs
 			exprs[index] = e
-			out = append(out, values...)
+			values, matched = parsedValues, true
 		}
+		if !matched {
+			continue
+		}
+		if !found {
+			out = values
+			found = true
+			continue
+		}
+		out = intersectTimeValues(out, values)
 	}
-	if len(out) == 0 {
+	if !found {
 		return nil, false, nil
+	}
+	return out, true, nil
+}
+
+// timeValuesFromOrExprs 仅当 OR 的每个分支都能确定为精确时间集合时才返回并集。
+func timeValuesFromOrExprs(exprs []clause.Expression, cfg ShardingConfig, key string) ([]time.Time, bool, error) {
+	out := make([]time.Time, 0)
+	for _, expr := range exprs {
+		values, ok, err := timeValuesFromExprs([]clause.Expression{expr}, cfg, key)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return nil, false, nil
+		}
+		for _, value := range values {
+			if !containsTime(out, value) {
+				out = append(out, value)
+			}
+		}
 	}
 	return out, true, nil
 }
@@ -652,10 +684,13 @@ func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg Shard
 		if err != nil {
 			return nil, false, err
 		}
-		if !leftOK && !rightOK {
-			return nil, false, nil
+		if !leftOK {
+			return right, rightOK, nil
 		}
-		return append(left, right...), true, nil
+		if !rightOK {
+			return left, true, nil
+		}
+		return intersectTimeValues(left, right), true, nil
 	case *sqlparser.OrExpr:
 		left, leftOK, err := timeValuesFromVitessExpr(e.Left, vars, cfg, key)
 		if err != nil {
@@ -681,6 +716,32 @@ func timeValuesFromVitessExpr(expr sqlparser.Expr, vars []interface{}, cfg Shard
 		}
 	}
 	return nil, false, nil
+}
+
+// intersectTimeValues 返回两个精确时间集合在同一 AND 条件中的交集。
+func intersectTimeValues(left, right []time.Time) []time.Time {
+	out := make([]time.Time, 0)
+	for _, candidate := range left {
+		if containsTime(out, candidate) {
+			continue
+		}
+		for _, other := range right {
+			if candidate.Equal(other) {
+				out = append(out, candidate)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func containsTime(values []time.Time, target time.Time) bool {
+	for _, value := range values {
+		if value.Equal(target) {
+			return true
+		}
+	}
+	return false
 }
 
 // timeRangeBoundsFromVitessExpr 仅接受 AND 组合的范围条件，避免 OR 条件被错误缩窄。
